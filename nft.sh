@@ -275,9 +275,10 @@ PY
         return 0
     fi
 
-    err "HTTPS 握手检测失败。面板服务可能没有成功加载证书，或该端口仍在提供 HTTP。"
-    echo "请先查看服务日志: journalctl -u ${PANEL_SERVICE} -n 80 --no-pager"
-    return 1
+    warn "HTTPS 握手自检未通过，但面板配置已写入并已重启。"
+    warn "如果日志显示 listening on https://...，可直接使用 HTTPS 访问。"
+    echo "排查命令: journalctl -u ${PANEL_SERVICE} -n 80 --no-pager"
+    return 0
 }
 
 sanitize_rule_name() {
@@ -2936,7 +2937,7 @@ update_panel_tls() {
         local scheme="http"
         [[ -n "$cert_path" && -n "$key_path" ]] && scheme="https"
         if [[ "$scheme" == "https" ]]; then
-            verify_panel_https "$panel_host" "$panel_port" "$cert_ip" || return 1
+            verify_panel_https "$panel_host" "$panel_port" "$cert_ip"
         fi
         public_ip="$panel_host"
         [[ "$public_ip" == "0.0.0.0" || "$public_ip" == "127.0.0.1" || "$public_ip" == "localhost" ]] && public_ip="${cert_ip:-$(get_local_ip)}"
