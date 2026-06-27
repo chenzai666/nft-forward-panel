@@ -144,7 +144,7 @@ install_acme_deps() {
 }
 
 ensure_acme_sh() {
-    local acme_bin acme_email install_cmd
+    local acme_bin acme_email
     acme_bin=$(find_acme_sh 2>/dev/null || true)
     if [[ -n "$acme_bin" ]]; then
         echo "$acme_bin"
@@ -172,6 +172,21 @@ ensure_acme_sh() {
     fi
 
     echo "$acme_bin"
+}
+
+ensure_acme_auto_renew() {
+    local acme_bin="$1"
+
+    "$acme_bin" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+    "$acme_bin" --install-cronjob >/dev/null 2>&1 || true
+
+    if command -v crontab &>/dev/null && crontab -l 2>/dev/null | grep -q "acme.sh.*--cron"; then
+        info "已确认 acme.sh 自动续期任务。"
+        return 0
+    fi
+
+    warn "未检测到 acme.sh cron 续期任务。证书已安装，但请确认系统允许 cron 运行。"
+    warn "可手动检查: crontab -l | grep acme.sh"
 }
 
 issue_ip_certificate() {
@@ -214,10 +229,42 @@ issue_ip_certificate() {
         return 1
     fi
 
+    ensure_acme_auto_renew "$acme_bin"
+
     chmod 600 "$key_path" 2>/dev/null || true
     info "IP 证书已申请并安装。"
+    info "acme.sh 将自动续期，续期后会执行: ${reload_cmd}"
     info "证书: ${cert_path}"
     info "私钥: ${key_path}"
+}
+
+get_panel_env() {
+    local key="$1"
+    if [[ -f "${PANEL_SERVICE_FILE}" ]]; then
+        sed -n -E "s|^Environment=\"${key}=([^\"]*)\"$|\\1|p" "${PANEL_SERVICE_FILE}" | tail -1
+    fi
+}
+
+verify_panel_https() {
+    local host="$1"
+    local port="$2"
+    local cert_ip="$3"
+
+    if ! command -v openssl &>/dev/null; then
+        warn "未安装 openssl，已跳过 HTTPS 握手检测。"
+        return 0
+    fi
+
+    local check_host="127.0.0.1"
+    [[ "$host" == "127.0.0.1" || "$host" == "localhost" ]] && check_host="$host"
+
+    if timeout 8 openssl s_client -connect "${check_host}:${port}" -servername "${cert_ip:-$check_host}" </dev/null >/dev/null 2>&1; then
+        return 0
+    fi
+
+    err "HTTPS 握手检测失败。面板服务可能没有成功加载证书，或你访问的是错误端口。"
+    echo "请先查看服务日志: journalctl -u ${PANEL_SERVICE} -n 80 --no-pager"
+    return 1
 }
 
 sanitize_rule_name() {
@@ -2763,13 +2810,15 @@ update_panel_tls() {
         return 1
     fi
 
-    local panel_host cert_path key_path cert_ip
+    local panel_host cert_path key_path cert_ip panel_port public_ip
     read -rp "监听 IP [默认 0.0.0.0，填 127.0.0.1 可仅本机访问]: " panel_host
     panel_host="${panel_host:-0.0.0.0}"
     if ! validate_listen_host "$panel_host"; then
         err "监听 IP 无效，请输入 0.0.0.0、127.0.0.1、localhost 或 IPv4 地址。"
         return 1
     fi
+    panel_port=$(get_panel_env "PANEL_PORT")
+    panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
 
     echo "HTTPS 证书配置：证书和私钥都留空则使用 HTTP。"
     echo "如填写的证书/私钥不存在，脚本会申请 Let's Encrypt 真实 IP 证书，不会生成自签证书。"
@@ -2833,9 +2882,16 @@ update_panel_tls() {
     if systemctl restart "${PANEL_SERVICE}"; then
         local scheme="http"
         [[ -n "$cert_path" && -n "$key_path" ]] && scheme="https"
+        if [[ "$scheme" == "https" ]]; then
+            verify_panel_https "$panel_host" "$panel_port" "$cert_ip" || return 1
+        fi
+        public_ip="$panel_host"
+        [[ "$public_ip" == "0.0.0.0" || "$public_ip" == "127.0.0.1" || "$public_ip" == "localhost" ]] && public_ip="${cert_ip:-$(get_local_ip)}"
         info "面板监听与证书配置已更新。"
         echo "监听 IP: ${panel_host}"
+        echo "面板端口: ${panel_port}"
         echo "访问协议: ${scheme}"
+        echo "访问地址: ${scheme}://${public_ip}:${panel_port}"
         log_action "修改 Web 面板监听/TLS: host=${panel_host} scheme=${scheme}"
     else
         err "面板重启失败，请查看: journalctl -u ${PANEL_SERVICE} -n 50"
