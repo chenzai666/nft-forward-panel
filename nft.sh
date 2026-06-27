@@ -2644,17 +2644,32 @@ update_panel_tls() {
             err "启用 HTTPS 时证书和私钥路径都必须填写。"
             return 1
         fi
-        if [[ ! -f "$cert_path" ]]; then
-            err "证书文件不存在: ${cert_path}"
-            return 1
-        fi
-        if [[ ! -f "$key_path" ]]; then
-            err "私钥文件不存在: ${key_path}"
-            return 1
-        fi
         if [[ "$cert_path" == *\"* || "$key_path" == *\"* ]]; then
             err "证书路径不能包含双引号。"
             return 1
+        fi
+        mkdir -p "$(dirname "$cert_path")" "$(dirname "$key_path")" 2>/dev/null || {
+            err "无法创建证书目录，请检查路径和权限。"
+            return 1
+        }
+        if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+            if ! command -v openssl &>/dev/null; then
+                err "证书文件不存在且未安装 openssl，无法自动生成自签名证书。"
+                return 1
+            fi
+            warn "证书或私钥不存在，将自动生成自签名证书。"
+            local cert_cn="${panel_host}"
+            [[ "$cert_cn" == "0.0.0.0" ]] && cert_cn="nft-forward-panel"
+            openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+                -keyout "$key_path" \
+                -out "$cert_path" \
+                -subj "/CN=${cert_cn}" >/dev/null 2>&1 || {
+                err "自签名证书生成失败。"
+                return 1
+            }
+            chmod 600 "$key_path" 2>/dev/null || true
+            info "已生成自签名证书: ${cert_path}"
+            info "已生成私钥: ${key_path}"
         fi
     fi
 
