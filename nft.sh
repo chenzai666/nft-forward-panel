@@ -28,6 +28,8 @@ PANEL_SERVICE_FILE="/etc/systemd/system/${PANEL_SERVICE}"
 PANEL_PORT_DEFAULT="4788"
 PANEL_USER_DEFAULT="admin"
 PANEL_PASS_DEFAULT="admin123"
+PANEL_CERT_DEFAULT="/root/ygkkkca/cert.crt"
+PANEL_KEY_DEFAULT="/root/ygkkkca/private.key"
 
 # ============== 日志函数 ==============
 log_action() {
@@ -2854,11 +2856,17 @@ update_panel_tls() {
     panel_port=$(get_panel_env "PANEL_PORT")
     panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
 
-    echo "HTTPS 证书配置：证书和私钥都留空则使用 HTTP。"
+    echo "HTTPS 证书配置：直接回车使用默认路径；如需关闭 HTTPS，请两项都输入 none。"
     echo "如填写的证书/私钥不存在，脚本会申请 Let's Encrypt 真实 IP 证书，不会生成自签证书。"
     echo "申请 IP 证书要求：公网 IP、80 端口可从公网访问、不能使用内网/回环 IP。"
-    read -rp "证书文件路径 cert/fullchain.pem: " cert_path
-    read -rp "私钥文件路径 key/privkey.pem: " key_path
+    read -rp "证书文件路径 [默认 ${PANEL_CERT_DEFAULT}]: " cert_path
+    read -rp "私钥文件路径 [默认 ${PANEL_KEY_DEFAULT}]: " key_path
+    cert_path="${cert_path:-$PANEL_CERT_DEFAULT}"
+    key_path="${key_path:-$PANEL_KEY_DEFAULT}"
+    if [[ "$cert_path" == "none" && "$key_path" == "none" ]]; then
+        cert_path=""
+        key_path=""
+    fi
 
     if [[ -n "$cert_path" || -n "$key_path" ]]; then
         if [[ -z "$cert_path" || -z "$key_path" ]]; then
