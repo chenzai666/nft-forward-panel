@@ -2309,6 +2309,7 @@ CONF_DIR = "/etc/nftables.d"
 CONF_FILE = "/etc/nftables.d/port-forward.conf"
 DNS_USER_CONF = "/etc/nftables.d/dns-forward.rules"
 DNS_CONF_FILE = "/etc/nftables.d/dns-forward.conf"
+MAIN_CONF = "/etc/nftables.conf"
 BACKUP_DIR = "/etc/nftables.d/backups"
 TABLE_NAME = "port_forward"
 DNS_TABLE = "port_forward_dns"
@@ -2379,6 +2380,23 @@ def ensure_dirs():
     os.makedirs(CONF_DIR, exist_ok=True)
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
+def ensure_persistence():
+    ensure_dirs()
+    include_line = 'include "/etc/nftables.d/*.conf"'
+    try:
+        if not os.path.exists(MAIN_CONF):
+            with open(MAIN_CONF, "w", encoding="utf-8") as f:
+                f.write("#!/usr/sbin/nft -f\n%s\n" % include_line)
+        else:
+            with open(MAIN_CONF, encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if include_line not in content:
+                with open(MAIN_CONF, "a", encoding="utf-8") as f:
+                    f.write("\n%s\n" % include_line)
+        sh(["systemctl", "enable", "nftables"])
+    except OSError:
+        pass
+
 def backup(path):
     if os.path.exists(path):
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -2404,7 +2422,7 @@ def load_rules():
     return rules
 
 def write_rules(rules):
-    ensure_dirs()
+    ensure_persistence()
     local_ip = get_local_ip()
     tmp = CONF_FILE + ".tmp.%d" % os.getpid()
     with open(tmp, "w", encoding="utf-8") as f:
@@ -2442,7 +2460,7 @@ def load_dns_rules():
     return rules
 
 def write_dns_user_rules(rules):
-    ensure_dirs()
+    ensure_persistence()
     tmp = DNS_USER_CONF + ".tmp.%d" % os.getpid()
     with open(tmp, "w", encoding="utf-8") as f:
         for r in rules:
@@ -2461,6 +2479,7 @@ def resolve_domain(domain):
     return ips
 
 def write_dns_nft(rules):
+    ensure_persistence()
     local_ip = get_local_ip()
     tmp = DNS_CONF_FILE + ".tmp.%d" % os.getpid()
     with open(tmp, "w", encoding="utf-8") as f:
@@ -2590,24 +2609,27 @@ table{width:100%;border-collapse:collapse}th,td{padding:12px 14px;border-bottom:
 </style></head><body><div class="shell"><header class="topbar"><div class="brand"><div class="mark">N</div><span>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</span></div><div class="topmeta"><span id="last">&#x6b63;&#x5728;&#x52a0;&#x8f7d;</span></div></header>
 <main class="wrap"><div class="toolbar"><div class="title"><h1>&#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x63a7;&#x5236;&#x53f0;</h1><p>&#x7ba1;&#x7406; nftables &#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x4e0e;&#x91cd;&#x8f7d;&#x72b6;&#x6001;&#x3002;</p></div><div class="actions"><button class="ghost" id="refreshBtn">&#x5237;&#x65b0;</button><button class="secondary" id="reloadBtn">&#x91cd;&#x8f7d; nft</button></div></div>
 <div class="status-grid"><div class="metric"><div class="label">nftables</div><div class="value" id="nftState">-</div><div class="hint">&#x7cfb;&#x7edf;&#x670d;&#x52a1;&#x72b6;&#x6001;</div></div><div class="metric"><div class="label">Web &#x9762;&#x677f;</div><div class="value" id="panelState">-</div><div class="hint">&#x9762;&#x677f;&#x670d;&#x52a1;</div></div><div class="metric"><div class="label">&#x666e;&#x901a;&#x8f6c;&#x53d1;</div><div class="value" id="portCount">0</div><div class="hint">DNAT &#x89c4;&#x5219;&#x6570;&#x91cf;</div></div><div class="metric"><div class="label">DNS &#x8f6c;&#x53d1;</div><div class="value" id="dnsCount">0</div><div class="hint">&#x57df;&#x540d;&#x89c4;&#x5219;&#x6570;&#x91cf;</div></div></div>
-<div id="msg" class="msg"></div><div class="stack"><section class="panel"><div class="panel-head"><h2>&#x65b0;&#x589e;&#x89c4;&#x5219;</h2><span class="badge green">&#x81ea;&#x52a8;&#x91cd;&#x8f7d;</span></div><div class="tabs" id="formTabs"><button class="tab active" data-form="port">&#x666e;&#x901a;</button><button class="tab" data-form="dns">DNS</button></div><div id="portForm" class="form"><div class="field"><label>&#x540d;&#x79f0;</label><input id="name" placeholder="&#x4f8b;&#x5982; web-api"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="lport" placeholder="10000"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="dport" placeholder="443"></div><div class="field"><label>&#x76ee;&#x6807; IPv4</label><input id="dip" placeholder="1.2.3.4"></div><button id="addRuleBtn">&#x6dfb;&#x52a0;&#x666e;&#x901a;&#x8f6c;&#x53d1;</button></div><div id="dnsForm" class="form dns-fields" style="display:none"><div class="field"><label>&#x57df;&#x540d;</label><input id="domain" placeholder="example.com"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="dlport" placeholder="10001"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="ddport" placeholder="443"></div><div class="field"><label>nft set</label><input id="setname" placeholder="&#x53ef;&#x7559;&#x7a7a;"></div><button id="addDnsBtn">&#x6dfb;&#x52a0; DNS &#x8f6c;&#x53d1;</button></div><p class="side-note">&#x9762;&#x677f;&#x4f1a;&#x5199;&#x5165; nftables &#x914d;&#x7f6e;&#x5e76;&#x91cd;&#x8f7d;&#x53d7;&#x7ba1;&#x8868;&#x3002;&#x7248;&#x672c; <span id="panelVersion">2026.06.27.6</span></p></section>
+<div id="msg" class="msg"></div><div class="stack"><section class="panel"><div class="panel-head"><h2>&#x65b0;&#x589e;&#x89c4;&#x5219;</h2><span class="badge green">&#x81ea;&#x52a8;&#x91cd;&#x8f7d;</span></div><div class="tabs" id="formTabs"><button class="tab active" data-form="port">&#x666e;&#x901a;</button><button class="tab" data-form="dns">DNS</button></div><div id="portForm" class="form"><div class="field"><label>&#x540d;&#x79f0;</label><input id="name" placeholder="&#x4f8b;&#x5982; web-api"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="lport" placeholder="10000"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="dport" placeholder="443"></div><div class="field"><label>&#x76ee;&#x6807; IPv4</label><input id="dip" placeholder="1.2.3.4"></div><button id="addRuleBtn">&#x6dfb;&#x52a0;&#x666e;&#x901a;&#x8f6c;&#x53d1;</button></div><div id="dnsForm" class="form dns-fields" style="display:none"><div class="field"><label>&#x57df;&#x540d;</label><input id="domain" placeholder="example.com"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="dlport" placeholder="10001"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="ddport" placeholder="443"></div><div class="field"><label>nft set</label><input id="setname" placeholder="&#x53ef;&#x7559;&#x7a7a;"></div><button id="addDnsBtn">&#x6dfb;&#x52a0; DNS &#x8f6c;&#x53d1;</button></div><p class="side-note">&#x9762;&#x677f;&#x4f1a;&#x5199;&#x5165; nftables &#x914d;&#x7f6e;&#x5e76;&#x91cd;&#x8f7d;&#x53d7;&#x7ba1;&#x8868;&#x3002;&#x7248;&#x672c; <span id="panelVersion">2026.06.27.7</span></p></section>
 <section class="panel"><div class="panel-head"><h2>&#x89c4;&#x5219;&#x5217;&#x8868;</h2><span class="badge blue" id="totalBadge">0 &#x6761;</span></div><div class="tabs" id="ruleTabs"><button class="tab active" data-tab="port">&#x666e;&#x901a;&#x8f6c;&#x53d1;</button><button class="tab" data-tab="dns">DNS &#x8f6c;&#x53d1;</button></div><div class="panel-body"><div id="portPane" class="tabpane active"><div id="rules"></div></div><div id="dnsPane" class="tabpane"><div id="dns"></div></div></div></section></div></main></div>
 <script>
-const $=id=>document.getElementById(id);let currentTab='port';
+const $=id=>document.getElementById(id);let currentTab='port';let editPort=null;let editDns=null;
 function showMsg(t,type='success'){const el=$('msg');el.textContent=t;el.className='msg show '+type;clearTimeout(window.msgTimer);window.msgTimer=setTimeout(()=>{el.className='msg'},4200)}
 async function api(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.statusText);return d}
 function stateClass(v){return v==='active'?'ok':(v==='inactive'||!v?'warn':'bad')}
 function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function switchTab(tab){currentTab=tab;document.querySelectorAll('#ruleTabs .tab').forEach((b,i)=>b.classList.toggle('active',(tab==='port'?i===0:i===1)));$('portPane').classList.toggle('active',tab==='port');$('dnsPane').classList.toggle('active',tab==='dns');$('totalBadge').textContent=(tab==='port'?$('portCount').textContent:$('dnsCount').textContent)+' \u6761'}
 function switchForm(tab){document.querySelectorAll('#formTabs .tab').forEach((b,i)=>b.classList.toggle('active',(tab==='port'?i===0:i===1)));$('portForm').style.display=tab==='port'?'grid':'none';$('dnsForm').style.display=tab==='dns'?'grid':'none'}
-function table(rows,kind){if(!rows.length)return '<div class="empty"><strong>\u6682\u65e0\u89c4\u5219</strong><span>\u6dfb\u52a0\u540e\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\u3002</span></div>';const isPort=kind==='rules';const heads=isPort?['\u540d\u79f0','\u5165\u53e3','\u76ee\u6807','\u7c7b\u578b','\u8fde\u901a\u6027','\u64cd\u4f5c']:['\u57df\u540d','\u5165\u53e3','\u76ee\u6807\u7aef\u53e3','set','\u8fde\u901a\u6027','\u64cd\u4f5c'];return '<table><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows.map((r,i)=>{const id=isPort?r.lport:i;const host=isPort?r.dip:r.domain;const port=isPort?r.dport:r.dport;const target=isPort?esc(r.dip)+':'+esc(r.dport):esc(r.dport);const first=isPort?esc(r.name||'\u672a\u547d\u540d'):esc(r.domain);const set=isPort?'<span class="badge green">tcp+udp</span>':'<span class="badge amber">'+esc(r.set_name)+'</span>';const test='<button class="ghost small testbtn" data-host="'+esc(host)+'" data-port="'+esc(port)+'">\u6d4b\u8bd5</button> <span class="testout" data-test="'+esc(host)+':'+esc(port)+'"></span>';return '<tr><td data-label="'+heads[0]+'" class="namecell">'+first+'</td><td data-label="'+heads[1]+'"><span class="badge blue">'+esc(r.lport)+'</span></td><td data-label="'+heads[2]+'" class="target">'+target+'</td><td data-label="'+heads[3]+'">'+set+'</td><td data-label="'+heads[4]+'">'+test+'</td><td data-label="\u64cd\u4f5c"><button class="danger small delbtn" data-kind="'+kind+'" data-id="'+esc(id)+'">\u5220\u9664</button></td></tr>'}).join('')+'</tbody></table>'}
+function table(rows,kind){if(!rows.length)return '<div class="empty"><strong>\u6682\u65e0\u89c4\u5219</strong><span>\u6dfb\u52a0\u540e\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\u3002</span></div>';const isPort=kind==='rules';const heads=isPort?['\u540d\u79f0','\u5165\u53e3','\u76ee\u6807','\u7c7b\u578b','\u8fde\u901a\u6027','\u64cd\u4f5c']:['\u57df\u540d','\u5165\u53e3','\u76ee\u6807\u7aef\u53e3','set','\u8fde\u901a\u6027','\u64cd\u4f5c'];return '<table><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows.map((r,i)=>{const id=isPort?r.lport:i;const host=isPort?r.dip:r.domain;const port=isPort?r.dport:r.dport;const target=isPort?esc(r.dip)+':'+esc(r.dport):esc(r.dport);const first=isPort?esc(r.name||'\u672a\u547d\u540d'):esc(r.domain);const set=isPort?'<span class="badge green">tcp+udp</span>':'<span class="badge amber">'+esc(r.set_name)+'</span>';const test='<button class="ghost small testbtn" data-host="'+esc(host)+'" data-port="'+esc(port)+'">\u6d4b\u8bd5</button> <span class="testout" data-test="'+esc(host)+':'+esc(port)+'"></span>';const editData=isPort?' data-kind="rules" data-id="'+esc(id)+'" data-name="'+esc(r.name||'')+'" data-lport="'+esc(r.lport)+'" data-dip="'+esc(r.dip)+'" data-dport="'+esc(r.dport)+'"':' data-kind="dns" data-id="'+esc(id)+'" data-domain="'+esc(r.domain)+'" data-lport="'+esc(r.lport)+'" data-dport="'+esc(r.dport)+'" data-set="'+esc(r.set_name)+'"';const ops='<button class="ghost small editbtn"'+editData+'>\u7f16\u8f91</button> <button class="danger small delbtn" data-kind="'+kind+'" data-id="'+esc(id)+'">\u5220\u9664</button>';return '<tr><td data-label="'+heads[0]+'" class="namecell">'+first+'</td><td data-label="'+heads[1]+'"><span class="badge blue">'+esc(r.lport)+'</span></td><td data-label="'+heads[2]+'" class="target">'+target+'</td><td data-label="'+heads[3]+'">'+set+'</td><td data-label="'+heads[4]+'">'+test+'</td><td data-label="\u64cd\u4f5c">'+ops+'</td></tr>'}).join('')+'</tbody></table>'}
 async function load(){try{const d=await api('/api/state');$('nftState').textContent=d.nftables||'-';$('panelState').textContent=d.panel||'-';$('nftState').className='value '+stateClass(d.nftables);$('panelState').className='value '+stateClass(d.panel);$('portCount').textContent=d.port_rules.length;$('dnsCount').textContent=d.dns_rules.length;$('rules').innerHTML=table(d.port_rules,'rules');$('dns').innerHTML=table(d.dns_rules,'dns');$('last').textContent='\u6700\u540e\u5237\u65b0 '+new Date().toLocaleTimeString();switchTab(currentTab)}catch(e){$('last').textContent='\u52a0\u8f7d\u5931\u8d25';showMsg(e.message,'error')}}
-async function addRule(){try{await api('/api/rules',{method:'POST',body:JSON.stringify({name:$('name').value,lport:$('lport').value,dip:$('dip').value,dport:$('dport').value})});['name','lport','dip','dport'].forEach(id=>$(id).value='');showMsg('\u666e\u901a\u8f6c\u53d1\u5df2\u6dfb\u52a0\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
-async function addDns(){try{await api('/api/dns',{method:'POST',body:JSON.stringify({domain:$('domain').value,lport:$('dlport').value,dport:$('ddport').value,set_name:$('setname').value})});['domain','dlport','ddport','setname'].forEach(id=>$(id).value='');showMsg('DNS \u8f6c\u53d1\u5df2\u6dfb\u52a0\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
+function clearPortEdit(){editPort=null;['name','lport','dip','dport'].forEach(id=>$(id).value='');$('addRuleBtn').textContent='\u6dfb\u52a0\u666e\u901a\u8f6c\u53d1'}
+function clearDnsEdit(){editDns=null;['domain','dlport','ddport','setname'].forEach(id=>$(id).value='');$('addDnsBtn').textContent='\u6dfb\u52a0 DNS \u8f6c\u53d1'}
+async function addRule(){try{const wasEdit=!!editPort;const body={name:$('name').value,lport:$('lport').value,dip:$('dip').value,dport:$('dport').value};if(editPort)body.old_lport=editPort.old_lport;await api('/api/rules',{method:'POST',body:JSON.stringify(body)});clearPortEdit();showMsg(wasEdit?'\u666e\u901a\u8f6c\u53d1\u5df2\u4fee\u6539\u5e76\u91cd\u8f7d\u3002':'\u666e\u901a\u8f6c\u53d1\u5df2\u6dfb\u52a0\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
+async function addDns(){try{const wasEdit=!!editDns;const body={domain:$('domain').value,lport:$('dlport').value,dport:$('ddport').value,set_name:$('setname').value};if(editDns)body.old_index=editDns.old_index;await api('/api/dns',{method:'POST',body:JSON.stringify(body)});clearDnsEdit();showMsg(wasEdit?'DNS \u8f6c\u53d1\u5df2\u4fee\u6539\u5e76\u91cd\u8f7d\u3002':'DNS \u8f6c\u53d1\u5df2\u6dfb\u52a0\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
+function edit(btn){if(btn.dataset.kind==='rules'){editPort={old_lport:btn.dataset.lport};switchForm('port');$('name').value=btn.dataset.name;$('lport').value=btn.dataset.lport;$('dip').value=btn.dataset.dip;$('dport').value=btn.dataset.dport;$('addRuleBtn').textContent='\u4fdd\u5b58\u666e\u901a\u8f6c\u53d1'}else{editDns={old_index:btn.dataset.id};switchForm('dns');$('domain').value=btn.dataset.domain;$('dlport').value=btn.dataset.lport;$('ddport').value=btn.dataset.dport;$('setname').value=btn.dataset.set;$('addDnsBtn').textContent='\u4fdd\u5b58 DNS \u8f6c\u53d1'}document.querySelector('.panel').scrollIntoView({behavior:'smooth',block:'start'})}
 async function del(kind,id){if(!confirm('\u786e\u8ba4\u5220\u9664\u8fd9\u6761\u89c4\u5219\uff1f'))return;try{await api('/api/'+kind+'/'+encodeURIComponent(id),{method:'DELETE'});showMsg('\u89c4\u5219\u5df2\u5220\u9664\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
 async function reloadRules(){try{await api('/api/reload',{method:'POST'});showMsg('nftables \u5df2\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
 async function testConn(btn){const out=btn.parentElement.querySelector('.testout');btn.disabled=true;out.textContent='\u6d4b\u8bd5\u4e2d...';out.className='testout';try{const d=await api('/api/test',{method:'POST',body:JSON.stringify({host:btn.dataset.host,port:btn.dataset.port,timeout:3})});if(d.ok){out.textContent='\u53ef\u8fbe '+d.elapsed_ms+'ms';out.className='testout ok'}else{out.textContent='\u5931\u8d25 '+d.elapsed_ms+'ms';out.className='testout bad';showMsg((d.host||btn.dataset.host)+':'+(d.port||btn.dataset.port)+' '+(d.error||'\u4e0d\u53ef\u8fbe'),'error')}}catch(e){out.textContent='\u5931\u8d25';out.className='testout bad';showMsg(e.message,'error')}finally{btn.disabled=false}}
-$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.querySelectorAll('#ruleTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchTab(btn.dataset.tab)));document.addEventListener('click',e=>{const delBtn=e.target.closest('.delbtn');if(delBtn)del(delBtn.dataset.kind,delBtn.dataset.id);const testBtn=e.target.closest('.testbtn');if(testBtn)testConn(testBtn)});load();
+$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.querySelectorAll('#ruleTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchTab(btn.dataset.tab)));document.addEventListener('click',e=>{const delBtn=e.target.closest('.delbtn');if(delBtn)del(delBtn.dataset.kind,delBtn.dataset.id);const testBtn=e.target.closest('.testbtn');if(testBtn)testConn(testBtn);const editBtn=e.target.closest('.editbtn');if(editBtn)edit(editBtn)});load();
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
@@ -2676,10 +2698,18 @@ class Handler(BaseHTTPRequestHandler):
                 lport, dip, dport = str(data.get("lport", "")), str(data.get("dip", "")), str(data.get("dport", ""))
                 if not valid_port(lport) or not valid_ip(dip) or not valid_port(dport):
                     raise ValueError("端口或 IP 格式无效")
-                rules = [r for r in load_rules() if r["lport"] != lport]
+                old_lport = str(data.get("old_lport") or lport)
+                if not valid_port(old_lport):
+                    raise ValueError("原入口端口格式无效")
+                old_rules = load_rules()
+                removed = [r for r in old_rules if r["lport"] == old_lport]
+                rules = [r for r in old_rules if r["lport"] not in (old_lport, lport)]
                 rules.append({"name": name, "lport": lport, "dip": dip, "dport": dport})
                 backup(CONF_FILE); write_rules(rules); reload_nft(); open_firewall_port(lport, dip, dport)
-                log("panel add port forward: %s -> %s:%s" % (lport, dip, dport))
+                if old_lport != lport:
+                    for r in removed:
+                        close_firewall_port(r["lport"], r["dip"], r["dport"])
+                log("panel save port forward: %s -> %s:%s" % (lport, dip, dport))
                 self.ok({"status": "ok"})
             elif self.path == "/api/dns":
                 data = self.body()
@@ -2688,10 +2718,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not valid_domain(domain) or not valid_port(lport) or not valid_port(dport):
                     raise ValueError("域名或端口格式无效")
                 set_name = safe_set_name(data.get("set_name") or ("%s_%s" % (domain.replace(".", "_").replace("-", "_"), lport)))
-                rules = [r for r in load_dns_rules() if not (r["domain"] == domain and r["lport"] == lport)]
+                rules = load_dns_rules()
+                old_index = data.get("old_index")
+                old_rule = None
+                if old_index not in (None, ""):
+                    old_index = int(old_index)
+                    if old_index < 0 or old_index >= len(rules):
+                        raise ValueError("原规则序号无效")
+                    old_rule = rules.pop(old_index)
+                rules = [r for r in rules if not (r["domain"] == domain and r["lport"] == lport)]
                 rules.append({"domain": domain, "lport": lport, "dport": dport, "set_name": set_name})
                 backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft(); open_firewall_port(lport)
-                log("panel add dns forward: %s:%s -> :%s" % (domain, lport, dport))
+                if old_rule and old_rule.get("lport") != lport:
+                    close_firewall_port(old_rule["lport"])
+                log("panel save dns forward: %s:%s -> :%s" % (domain, lport, dport))
                 self.ok({"status": "ok"})
             elif self.path == "/api/reload":
                 write_dns_nft(load_dns_rules())
