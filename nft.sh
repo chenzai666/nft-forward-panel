@@ -2623,6 +2623,63 @@ def status():
         "dns_rules": load_dns_rules(),
     }
 
+def export_rules_data():
+    return {
+        "format": "nft-forward-panel",
+        "version": 1,
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "port_rules": load_rules(),
+        "dns_rules": load_dns_rules(),
+    }
+
+def import_rules_data(data):
+    if not isinstance(data, dict):
+        raise ValueError("导入文件格式无效")
+    port_rules = data.get("port_rules", [])
+    dns_rules = data.get("dns_rules", [])
+    if not isinstance(port_rules, list) or not isinstance(dns_rules, list):
+        raise ValueError("导入文件缺少规则列表")
+
+    clean_ports = []
+    used_ports = set()
+    for item in port_rules:
+        if not isinstance(item, dict):
+            raise ValueError("普通转发规则格式无效")
+        name = safe_name(item.get("name"))
+        lport = str(item.get("lport", ""))
+        dip = str(item.get("dip", "")).strip()
+        dport = str(item.get("dport", ""))
+        if not valid_port(lport) or not valid_ip(dip) or not valid_port(dport):
+            raise ValueError("普通转发规则包含无效端口或 IP")
+        if lport in used_ports:
+            raise ValueError("入口端口重复: %s" % lport)
+        used_ports.add(lport)
+        clean_ports.append({"name": name, "lport": lport, "dip": dip, "dport": dport})
+
+    clean_dns = []
+    for item in dns_rules:
+        if not isinstance(item, dict):
+            raise ValueError("DNS 转发规则格式无效")
+        domain = str(item.get("domain", "")).strip().lower()
+        lport = str(item.get("lport", ""))
+        dport = str(item.get("dport", ""))
+        if not valid_forward_domain(domain) or not valid_port(lport) or not valid_port(dport):
+            raise ValueError("DNS 转发规则包含无效域名或端口")
+        set_name = unique_set_name(item.get("set_name") or ("%s_%s" % (domain.replace(".", "_").replace("-", "_"), lport)), clean_dns)
+        clean_dns.append({"domain": domain, "lport": lport, "dport": dport, "set_name": set_name})
+
+    backup(CONF_FILE); backup(DNS_USER_CONF)
+    write_rules(clean_ports)
+    write_dns_user_rules(clean_dns)
+    write_dns_nft(clean_dns)
+    reload_nft()
+    for r in clean_ports:
+        open_firewall_port(r["lport"], r["dip"], r["dport"])
+    for r in clean_dns:
+        open_firewall_port(r["lport"])
+    log("panel import rules: port=%d dns=%d" % (len(clean_ports), len(clean_dns)))
+    return {"status": "ok", "port_count": len(clean_ports), "dns_count": len(clean_dns)}
+
 def test_connectivity(host, port, timeout_sec):
     host = str(host or "").strip().lower()
     port = str(port or "").strip()
@@ -2662,7 +2719,7 @@ table{width:100%;border-collapse:separate;border-spacing:0 10px;padding:0 14px 1
 @media(max-width:980px){body{background-attachment:scroll}.form,.form.dns-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.form button{grid-column:1/-1}.toolbar{align-items:flex-start;flex-direction:column}.actions{width:100%}.actions button{flex:1}.topbar{padding:0 16px}}
 @media(max-width:680px){.wrap{padding:14px}.form,.form.dns-fields{grid-template-columns:1fr}.topmeta{display:none}.brand span{font-size:15px}table{border-spacing:0;padding:0}th{display:none}tr{display:block;border-bottom:1px solid rgba(255,255,255,.30);padding:9px 0;background:rgba(255,255,255,.42)}td{display:flex;justify-content:space-between;gap:14px;border:0;background:transparent;padding:7px 14px;word-break:break-all}tr td:first-child,tr td:last-child{border-radius:0}td:before{content:attr(data-label);color:#64748b;font-size:12px;font-weight:700;flex:0 0 auto}.namecell{font-weight:800}}
 </style></head><body><div class="shell"><header class="topbar"><div class="brand"><div class="mark">N</div><span>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</span></div><div class="topmeta"><span id="last">&#x6b63;&#x5728;&#x52a0;&#x8f7d;</span></div></header>
-<main class="wrap"><div class="toolbar"><div class="title"><h1>&#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x63a7;&#x5236;&#x53f0;</h1><p>&#x7ba1;&#x7406; nftables &#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x4e0e;&#x91cd;&#x8f7d;&#x72b6;&#x6001;&#x3002;</p></div><div class="actions"><button class="ghost" id="refreshBtn">&#x5237;&#x65b0;</button><button class="secondary" id="reloadBtn">&#x91cd;&#x8f7d; nft</button></div></div>
+<main class="wrap"><div class="toolbar"><div class="title"><h1>&#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x63a7;&#x5236;&#x53f0;</h1><p>&#x7ba1;&#x7406; nftables &#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x4e0e;&#x91cd;&#x8f7d;&#x72b6;&#x6001;&#x3002;</p></div><div class="actions"><button class="ghost" id="refreshBtn">&#x5237;&#x65b0;</button><button class="ghost" id="exportBtn">&#x5bfc;&#x51fa;</button><button class="ghost" id="importBtn">&#x5bfc;&#x5165;</button><button class="secondary" id="reloadBtn">&#x91cd;&#x8f7d; nft</button><input id="importFile" type="file" accept="application/json,.json" style="display:none"></div></div>
 <div class="status-grid"><div class="metric"><div class="label">nftables</div><div class="value" id="nftState">-</div><div class="hint">&#x7cfb;&#x7edf;&#x670d;&#x52a1;&#x72b6;&#x6001;</div></div><div class="metric"><div class="label">Web &#x9762;&#x677f;</div><div class="value" id="panelState">-</div><div class="hint">&#x9762;&#x677f;&#x670d;&#x52a1;</div></div><div class="metric"><div class="label">&#x666e;&#x901a;&#x8f6c;&#x53d1;</div><div class="value" id="portCount">0</div><div class="hint">DNAT &#x89c4;&#x5219;&#x6570;&#x91cf;</div></div><div class="metric"><div class="label">DNS &#x8f6c;&#x53d1;</div><div class="value" id="dnsCount">0</div><div class="hint">&#x57df;&#x540d;&#x89c4;&#x5219;&#x6570;&#x91cf;</div></div></div>
 <div id="msg" class="msg"></div><div class="stack"><section class="panel"><div class="panel-head"><h2>&#x65b0;&#x589e;&#x89c4;&#x5219;</h2><span class="badge green">&#x81ea;&#x52a8;&#x91cd;&#x8f7d;</span></div><div class="tabs" id="formTabs"><button class="tab active" data-form="port">&#x666e;&#x901a;</button><button class="tab" data-form="dns">DNS</button></div><div id="portForm" class="form"><div class="field"><label>&#x540d;&#x79f0;</label><input id="name" placeholder="&#x4f8b;&#x5982; web-api"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="lport" placeholder="10000"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="dport" placeholder="443"></div><div class="field"><label>&#x76ee;&#x6807; IP / &#x57df;&#x540d;</label><input id="dip" placeholder="1.2.3.4 或 example.com"></div><button id="addRuleBtn">&#x6dfb;&#x52a0;&#x8f6c;&#x53d1;</button></div><div id="dnsForm" class="form dns-fields" style="display:none"><div class="field"><label>&#x57df;&#x540d;</label><input id="domain" placeholder="example.com"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="dlport" placeholder="10001"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="ddport" placeholder="443"></div><div class="field"><label>nft set</label><input id="setname" placeholder="&#x53ef;&#x7559;&#x7a7a;"></div><button id="addDnsBtn">&#x6dfb;&#x52a0; DNS &#x8f6c;&#x53d1;</button></div><p class="side-note">&#x666e;&#x901a;&#x5165;&#x53e3;&#x53ef;&#x76f4;&#x63a5;&#x586b; IP &#x6216;&#x57df;&#x540d;&#xff1b;&#x57df;&#x540d;&#x4f1a;&#x81ea;&#x52a8;&#x5199;&#x5165; DNS &#x52a8;&#x6001;&#x8f6c;&#x53d1;&#x3002;&#x7248;&#x672c; <span id="panelVersion">2026.06.27.8</span></p></section>
 <section class="panel"><div class="panel-head"><h2>&#x89c4;&#x5219;&#x5217;&#x8868;</h2><span class="badge blue" id="totalBadge">0 &#x6761;</span></div><div class="tabs" id="ruleTabs"><button class="tab active" data-tab="port">&#x666e;&#x901a;&#x8f6c;&#x53d1;</button><button class="tab" data-tab="dns">DNS &#x8f6c;&#x53d1;</button></div><div class="panel-body"><div id="portPane" class="tabpane active"><div id="rules"></div></div><div id="dnsPane" class="tabpane"><div id="dns"></div></div></div></section></div></main></div>
@@ -2683,8 +2740,10 @@ async function addDns(){try{const wasEdit=!!editDns;const body={domain:$('domain
 function edit(btn){if(btn.dataset.kind==='rules'){editPort={old_lport:btn.dataset.lport};switchForm('port');$('name').value=btn.dataset.name;$('lport').value=btn.dataset.lport;$('dip').value=btn.dataset.dip;$('dport').value=btn.dataset.dport;$('addRuleBtn').textContent='\u4fdd\u5b58\u8f6c\u53d1'}else{editDns={old_index:btn.dataset.id};switchForm('dns');$('domain').value=btn.dataset.domain;$('dlport').value=btn.dataset.lport;$('ddport').value=btn.dataset.dport;$('setname').value=btn.dataset.set;$('addDnsBtn').textContent='\u4fdd\u5b58 DNS \u8f6c\u53d1'}document.querySelector('.panel').scrollIntoView({behavior:'smooth',block:'start'})}
 async function del(kind,id){if(!confirm('\u786e\u8ba4\u5220\u9664\u8fd9\u6761\u89c4\u5219\uff1f'))return;try{await api('/api/'+kind+'/'+encodeURIComponent(id),{method:'DELETE'});showMsg('\u89c4\u5219\u5df2\u5220\u9664\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
 async function reloadRules(){try{await api('/api/reload',{method:'POST'});showMsg('nftables \u5df2\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
+function exportRules(){window.location.href='/api/export'}
+async function importRules(file){if(!file)return;if(!confirm('\u5bfc\u5165\u540e\u4f1a\u8986\u76d6\u5f53\u524d\u9762\u677f\u89c4\u5219\uff0c\u786e\u8ba4\u7ee7\u7eed\uff1f'))return;try{const text=await file.text();const data=JSON.parse(text);const res=await api('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});showMsg('\u5bfc\u5165\u5b8c\u6210\uff1a\u666e\u901a '+res.port_count+' \u6761\uff0cDNS '+res.dns_count+' \u6761\u3002');load()}catch(e){showMsg('\u5bfc\u5165\u5931\u8d25\uff1a'+e.message,'error')}finally{$('importFile').value=''}}
 async function testConn(btn){const out=btn.parentElement.querySelector('.testout');btn.disabled=true;out.textContent='\u6d4b\u8bd5\u4e2d...';out.className='testout';try{const d=await api('/api/test',{method:'POST',body:JSON.stringify({host:btn.dataset.host,port:btn.dataset.port,timeout:3})});if(d.ok){out.textContent='\u53ef\u8fbe '+d.elapsed_ms+'ms';out.className='testout ok'}else{out.textContent='\u5931\u8d25 '+d.elapsed_ms+'ms';out.className='testout bad';showMsg((d.host||btn.dataset.host)+':'+(d.port||btn.dataset.port)+' '+(d.error||'\u4e0d\u53ef\u8fbe'),'error')}}catch(e){out.textContent='\u5931\u8d25';out.className='testout bad';showMsg(e.message,'error')}finally{btn.disabled=false}}
-$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.querySelectorAll('#ruleTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchTab(btn.dataset.tab)));document.addEventListener('click',e=>{const delBtn=e.target.closest('.delbtn');if(delBtn)del(delBtn.dataset.kind,delBtn.dataset.id);const testBtn=e.target.closest('.testbtn');if(testBtn)testConn(testBtn);const editBtn=e.target.closest('.editbtn');if(editBtn)edit(editBtn)});load();
+$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('exportBtn').addEventListener('click',exportRules);$('importBtn').addEventListener('click',()=>$('importFile').click());$('importFile').addEventListener('change',e=>importRules(e.target.files[0]));$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.querySelectorAll('#ruleTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchTab(btn.dataset.tab)));document.addEventListener('click',e=>{const delBtn=e.target.closest('.delbtn');if(delBtn)del(delBtn.dataset.kind,delBtn.dataset.id);const testBtn=e.target.closest('.testbtn');if(testBtn)testConn(testBtn);const editBtn=e.target.closest('.editbtn');if(editBtn)edit(editBtn)});load();
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
@@ -2740,6 +2799,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
         elif self.path == "/api/state":
             self.ok(status())
+        elif self.path == "/api/export":
+            raw = json.dumps(export_rules_data(), ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="nft-forward-rules.json"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
         else:
             self.fail(HTTPStatus.NOT_FOUND, "not found")
 
@@ -2811,6 +2879,9 @@ class Handler(BaseHTTPRequestHandler):
                 write_dns_nft(load_dns_rules())
                 reload_nft()
                 self.ok({"status": "ok"})
+            elif self.path == "/api/import":
+                data = self.body()
+                self.ok(import_rules_data(data))
             elif self.path == "/api/test":
                 data = self.body()
                 self.ok(test_connectivity(data.get("host"), data.get("port"), data.get("timeout")))
