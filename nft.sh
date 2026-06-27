@@ -2283,6 +2283,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import time
@@ -2330,6 +2331,10 @@ def valid_ip(value):
 
 def valid_domain(value):
     return bool(re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", (value or "").lower()))
+
+def valid_test_host(value):
+    value = (value or "").strip().lower()
+    return valid_ip(value) or valid_domain(value)
 
 def safe_name(value, limit=60):
     value = (value or "").replace("\r", " ").replace("\n", " ").replace("|", "-")
@@ -2525,6 +2530,30 @@ def status():
         "dns_rules": load_dns_rules(),
     }
 
+def test_connectivity(host, port, timeout_sec):
+    host = str(host or "").strip().lower()
+    port = str(port or "").strip()
+    try:
+        timeout_sec = float(timeout_sec or 3)
+    except ValueError:
+        timeout_sec = 3
+    timeout_sec = max(1.0, min(timeout_sec, 10.0))
+
+    if not valid_test_host(host):
+        raise ValueError("目标地址格式无效")
+    if not valid_port(port):
+        raise ValueError("目标端口格式无效")
+
+    started = time.monotonic()
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout_sec) as s:
+            peer = "%s:%s" % s.getpeername()[:2]
+        elapsed = int((time.monotonic() - started) * 1000)
+        return {"ok": True, "host": host, "port": int(port), "elapsed_ms": elapsed, "peer": peer}
+    except Exception as e:
+        elapsed = int((time.monotonic() - started) * 1000)
+        return {"ok": False, "host": host, "port": int(port), "elapsed_ms": elapsed, "error": str(e)}
+
 HTML = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</title>
@@ -2538,6 +2567,7 @@ button{height:38px;border:0;border-radius:7px;padding:0 13px;background:var(--bl
 .stack{display:grid;gap:18px}.panel{min-width:0;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}.panel-head{display:flex;align-items:center;justify-content:space-between;padding:15px 16px;border-bottom:1px solid var(--line)}.panel-head h2{margin:0;font-size:16px}.panel-body{padding:0}
 .tabs{display:flex;gap:6px;padding:10px;border-bottom:1px solid var(--line);background:#fafbfc}.tab{height:34px;background:transparent;color:#334155;border:1px solid transparent}.tab.active{background:#fff;border-color:var(--line);color:#0f172a}.tabpane{display:none}.tabpane.active{display:block}
 table{width:100%;border-collapse:collapse}th,td{padding:12px 14px;border-bottom:1px solid #edf0f5;text-align:left;vertical-align:middle}th{font-size:12px;letter-spacing:.02em;text-transform:uppercase;color:#64748b;background:#fafbfc}td{font-size:14px}.target{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.namecell{font-weight:750}.badge{display:inline-flex;align-items:center;gap:6px;height:24px;border-radius:999px;padding:0 9px;font-size:12px;font-weight:700}.badge.blue{background:var(--soft-blue);color:#1d4ed8}.badge.green{background:var(--soft-green);color:#047857}.badge.amber{background:var(--soft-amber);color:#92400e}
+.testout{display:inline-flex;margin-left:8px;font-size:12px;font-weight:750;color:#64748b;white-space:nowrap}.testout.ok{color:#047857}.testout.bad{color:#dc2626}
 .empty{padding:52px 20px;text-align:center;color:var(--muted)}.empty strong{display:block;color:#334155;margin-bottom:6px;font-size:15px}
 .form{padding:16px;display:grid;grid-template-columns:1.2fr 1fr 1fr 1.2fr auto;gap:12px;align-items:end}.form.dns-fields{grid-template-columns:1.4fr 1fr 1fr 1fr auto}.field{display:grid;gap:6px;min-width:0}.field label{font-size:12px;color:#526071;font-weight:750}input{width:100%;min-width:0;height:38px;border:1px solid #cbd5e1;border-radius:7px;padding:0 10px;font-size:14px;background:#fff;color:#111827}input:focus{outline:2px solid #bfdbfe;border-color:#60a5fa}.side-note{padding:12px 14px;margin:0 16px 16px;border-radius:8px;background:#f8fafc;border:1px solid var(--line);color:#64748b;font-size:13px}
 .msg{position:fixed;right:20px;bottom:20px;max-width:min(460px,calc(100vw - 40px));white-space:pre-wrap;background:#0f172a;color:#e5e7eb;border-radius:8px;padding:13px 15px;display:none;font-size:13px;box-shadow:0 18px 50px rgba(15,23,42,.25);z-index:10}.msg.show{display:block}.msg.error{background:#7f1d1d}.msg.success{background:#064e3b}
@@ -2546,7 +2576,7 @@ table{width:100%;border-collapse:collapse}th,td{padding:12px 14px;border-bottom:
 </style></head><body><div class="shell"><header class="topbar"><div class="brand"><div class="mark">N</div><span>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</span></div><div class="topmeta"><span id="last">&#x6b63;&#x5728;&#x52a0;&#x8f7d;</span></div></header>
 <main class="wrap"><div class="toolbar"><div class="title"><h1>&#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x63a7;&#x5236;&#x53f0;</h1><p>&#x7ba1;&#x7406; nftables &#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x4e0e;&#x91cd;&#x8f7d;&#x72b6;&#x6001;&#x3002;</p></div><div class="actions"><button class="ghost" id="refreshBtn">&#x5237;&#x65b0;</button><button class="secondary" id="reloadBtn">&#x91cd;&#x8f7d; nft</button></div></div>
 <div class="status-grid"><div class="metric"><div class="label">nftables</div><div class="value" id="nftState">-</div><div class="hint">&#x7cfb;&#x7edf;&#x670d;&#x52a1;&#x72b6;&#x6001;</div></div><div class="metric"><div class="label">Web &#x9762;&#x677f;</div><div class="value" id="panelState">-</div><div class="hint">&#x9762;&#x677f;&#x670d;&#x52a1;</div></div><div class="metric"><div class="label">&#x666e;&#x901a;&#x8f6c;&#x53d1;</div><div class="value" id="portCount">0</div><div class="hint">DNAT &#x89c4;&#x5219;&#x6570;&#x91cf;</div></div><div class="metric"><div class="label">DNS &#x8f6c;&#x53d1;</div><div class="value" id="dnsCount">0</div><div class="hint">&#x57df;&#x540d;&#x89c4;&#x5219;&#x6570;&#x91cf;</div></div></div>
-<div id="msg" class="msg"></div><div class="stack"><section class="panel"><div class="panel-head"><h2>&#x65b0;&#x589e;&#x89c4;&#x5219;</h2><span class="badge green">&#x81ea;&#x52a8;&#x91cd;&#x8f7d;</span></div><div class="tabs" id="formTabs"><button class="tab active" data-form="port">&#x666e;&#x901a;</button><button class="tab" data-form="dns">DNS</button></div><div id="portForm" class="form"><div class="field"><label>&#x540d;&#x79f0;</label><input id="name" placeholder="&#x4f8b;&#x5982; web-api"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="lport" placeholder="10000"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="dport" placeholder="443"></div><div class="field"><label>&#x76ee;&#x6807; IPv4</label><input id="dip" placeholder="1.2.3.4"></div><button id="addRuleBtn">&#x6dfb;&#x52a0;&#x666e;&#x901a;&#x8f6c;&#x53d1;</button></div><div id="dnsForm" class="form dns-fields" style="display:none"><div class="field"><label>&#x57df;&#x540d;</label><input id="domain" placeholder="example.com"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="dlport" placeholder="10001"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="ddport" placeholder="443"></div><div class="field"><label>nft set</label><input id="setname" placeholder="&#x53ef;&#x7559;&#x7a7a;"></div><button id="addDnsBtn">&#x6dfb;&#x52a0; DNS &#x8f6c;&#x53d1;</button></div><p class="side-note">&#x9762;&#x677f;&#x4f1a;&#x5199;&#x5165; nftables &#x914d;&#x7f6e;&#x5e76;&#x91cd;&#x8f7d;&#x53d7;&#x7ba1;&#x8868;&#x3002;&#x7248;&#x672c; <span id="panelVersion">2026.06.27.5</span></p></section>
+<div id="msg" class="msg"></div><div class="stack"><section class="panel"><div class="panel-head"><h2>&#x65b0;&#x589e;&#x89c4;&#x5219;</h2><span class="badge green">&#x81ea;&#x52a8;&#x91cd;&#x8f7d;</span></div><div class="tabs" id="formTabs"><button class="tab active" data-form="port">&#x666e;&#x901a;</button><button class="tab" data-form="dns">DNS</button></div><div id="portForm" class="form"><div class="field"><label>&#x540d;&#x79f0;</label><input id="name" placeholder="&#x4f8b;&#x5982; web-api"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="lport" placeholder="10000"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="dport" placeholder="443"></div><div class="field"><label>&#x76ee;&#x6807; IPv4</label><input id="dip" placeholder="1.2.3.4"></div><button id="addRuleBtn">&#x6dfb;&#x52a0;&#x666e;&#x901a;&#x8f6c;&#x53d1;</button></div><div id="dnsForm" class="form dns-fields" style="display:none"><div class="field"><label>&#x57df;&#x540d;</label><input id="domain" placeholder="example.com"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="dlport" placeholder="10001"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="ddport" placeholder="443"></div><div class="field"><label>nft set</label><input id="setname" placeholder="&#x53ef;&#x7559;&#x7a7a;"></div><button id="addDnsBtn">&#x6dfb;&#x52a0; DNS &#x8f6c;&#x53d1;</button></div><p class="side-note">&#x9762;&#x677f;&#x4f1a;&#x5199;&#x5165; nftables &#x914d;&#x7f6e;&#x5e76;&#x91cd;&#x8f7d;&#x53d7;&#x7ba1;&#x8868;&#x3002;&#x7248;&#x672c; <span id="panelVersion">2026.06.27.6</span></p></section>
 <section class="panel"><div class="panel-head"><h2>&#x89c4;&#x5219;&#x5217;&#x8868;</h2><span class="badge blue" id="totalBadge">0 &#x6761;</span></div><div class="tabs" id="ruleTabs"><button class="tab active" data-tab="port">&#x666e;&#x901a;&#x8f6c;&#x53d1;</button><button class="tab" data-tab="dns">DNS &#x8f6c;&#x53d1;</button></div><div class="panel-body"><div id="portPane" class="tabpane active"><div id="rules"></div></div><div id="dnsPane" class="tabpane"><div id="dns"></div></div></div></section></div></main></div>
 <script>
 const $=id=>document.getElementById(id);let currentTab='port';
@@ -2556,13 +2586,14 @@ function stateClass(v){return v==='active'?'ok':(v==='inactive'||!v?'warn':'bad'
 function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function switchTab(tab){currentTab=tab;document.querySelectorAll('#ruleTabs .tab').forEach((b,i)=>b.classList.toggle('active',(tab==='port'?i===0:i===1)));$('portPane').classList.toggle('active',tab==='port');$('dnsPane').classList.toggle('active',tab==='dns');$('totalBadge').textContent=(tab==='port'?$('portCount').textContent:$('dnsCount').textContent)+' \u6761'}
 function switchForm(tab){document.querySelectorAll('#formTabs .tab').forEach((b,i)=>b.classList.toggle('active',(tab==='port'?i===0:i===1)));$('portForm').style.display=tab==='port'?'grid':'none';$('dnsForm').style.display=tab==='dns'?'grid':'none'}
-function table(rows,kind){if(!rows.length)return '<div class="empty"><strong>\u6682\u65e0\u89c4\u5219</strong><span>\u6dfb\u52a0\u540e\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\u3002</span></div>';const isPort=kind==='rules';const heads=isPort?['\u540d\u79f0','\u5165\u53e3','\u76ee\u6807','\u7c7b\u578b','\u64cd\u4f5c']:['\u57df\u540d','\u5165\u53e3','\u76ee\u6807\u7aef\u53e3','set','\u64cd\u4f5c'];return '<table><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows.map((r,i)=>{const id=isPort?r.lport:i;const target=isPort?esc(r.dip)+':'+esc(r.dport):esc(r.dport);const first=isPort?esc(r.name||'\u672a\u547d\u540d'):esc(r.domain);const set=isPort?'<span class="badge green">tcp+udp</span>':'<span class="badge amber">'+esc(r.set_name)+'</span>';return '<tr><td data-label="'+heads[0]+'" class="namecell">'+first+'</td><td data-label="'+heads[1]+'"><span class="badge blue">'+esc(r.lport)+'</span></td><td data-label="'+heads[2]+'" class="target">'+target+'</td><td data-label="'+heads[3]+'">'+set+'</td><td data-label="\u64cd\u4f5c"><button class="danger small delbtn" data-kind="'+kind+'" data-id="'+esc(id)+'">\u5220\u9664</button></td></tr>'}).join('')+'</tbody></table>'}
+function table(rows,kind){if(!rows.length)return '<div class="empty"><strong>\u6682\u65e0\u89c4\u5219</strong><span>\u6dfb\u52a0\u540e\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\u3002</span></div>';const isPort=kind==='rules';const heads=isPort?['\u540d\u79f0','\u5165\u53e3','\u76ee\u6807','\u7c7b\u578b','\u8fde\u901a\u6027','\u64cd\u4f5c']:['\u57df\u540d','\u5165\u53e3','\u76ee\u6807\u7aef\u53e3','set','\u8fde\u901a\u6027','\u64cd\u4f5c'];return '<table><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows.map((r,i)=>{const id=isPort?r.lport:i;const host=isPort?r.dip:r.domain;const port=isPort?r.dport:r.dport;const target=isPort?esc(r.dip)+':'+esc(r.dport):esc(r.dport);const first=isPort?esc(r.name||'\u672a\u547d\u540d'):esc(r.domain);const set=isPort?'<span class="badge green">tcp+udp</span>':'<span class="badge amber">'+esc(r.set_name)+'</span>';const test='<button class="ghost small testbtn" data-host="'+esc(host)+'" data-port="'+esc(port)+'">\u6d4b\u8bd5</button> <span class="testout" data-test="'+esc(host)+':'+esc(port)+'"></span>';return '<tr><td data-label="'+heads[0]+'" class="namecell">'+first+'</td><td data-label="'+heads[1]+'"><span class="badge blue">'+esc(r.lport)+'</span></td><td data-label="'+heads[2]+'" class="target">'+target+'</td><td data-label="'+heads[3]+'">'+set+'</td><td data-label="'+heads[4]+'">'+test+'</td><td data-label="\u64cd\u4f5c"><button class="danger small delbtn" data-kind="'+kind+'" data-id="'+esc(id)+'">\u5220\u9664</button></td></tr>'}).join('')+'</tbody></table>'}
 async function load(){try{const d=await api('/api/state');$('nftState').textContent=d.nftables||'-';$('panelState').textContent=d.panel||'-';$('nftState').className='value '+stateClass(d.nftables);$('panelState').className='value '+stateClass(d.panel);$('portCount').textContent=d.port_rules.length;$('dnsCount').textContent=d.dns_rules.length;$('rules').innerHTML=table(d.port_rules,'rules');$('dns').innerHTML=table(d.dns_rules,'dns');$('last').textContent='\u6700\u540e\u5237\u65b0 '+new Date().toLocaleTimeString();switchTab(currentTab)}catch(e){$('last').textContent='\u52a0\u8f7d\u5931\u8d25';showMsg(e.message,'error')}}
 async function addRule(){try{await api('/api/rules',{method:'POST',body:JSON.stringify({name:$('name').value,lport:$('lport').value,dip:$('dip').value,dport:$('dport').value})});['name','lport','dip','dport'].forEach(id=>$(id).value='');showMsg('\u666e\u901a\u8f6c\u53d1\u5df2\u6dfb\u52a0\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
 async function addDns(){try{await api('/api/dns',{method:'POST',body:JSON.stringify({domain:$('domain').value,lport:$('dlport').value,dport:$('ddport').value,set_name:$('setname').value})});['domain','dlport','ddport','setname'].forEach(id=>$(id).value='');showMsg('DNS \u8f6c\u53d1\u5df2\u6dfb\u52a0\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
 async function del(kind,id){if(!confirm('\u786e\u8ba4\u5220\u9664\u8fd9\u6761\u89c4\u5219\uff1f'))return;try{await api('/api/'+kind+'/'+encodeURIComponent(id),{method:'DELETE'});showMsg('\u89c4\u5219\u5df2\u5220\u9664\u5e76\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
 async function reloadRules(){try{await api('/api/reload',{method:'POST'});showMsg('nftables \u5df2\u91cd\u8f7d\u3002');load()}catch(e){showMsg(e.message,'error')}}
-$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.querySelectorAll('#ruleTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchTab(btn.dataset.tab)));document.addEventListener('click',e=>{const btn=e.target.closest('.delbtn');if(btn)del(btn.dataset.kind,btn.dataset.id)});load();
+async function testConn(btn){const out=btn.parentElement.querySelector('.testout');btn.disabled=true;out.textContent='\u6d4b\u8bd5\u4e2d...';out.className='testout';try{const d=await api('/api/test',{method:'POST',body:JSON.stringify({host:btn.dataset.host,port:btn.dataset.port,timeout:3})});if(d.ok){out.textContent='\u53ef\u8fbe '+d.elapsed_ms+'ms';out.className='testout ok'}else{out.textContent='\u5931\u8d25 '+d.elapsed_ms+'ms';out.className='testout bad';showMsg((d.host||btn.dataset.host)+':'+(d.port||btn.dataset.port)+' '+(d.error||'\u4e0d\u53ef\u8fbe'),'error')}}catch(e){out.textContent='\u5931\u8d25';out.className='testout bad';showMsg(e.message,'error')}finally{btn.disabled=false}}
+$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.querySelectorAll('#ruleTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchTab(btn.dataset.tab)));document.addEventListener('click',e=>{const delBtn=e.target.closest('.delbtn');if(delBtn)del(delBtn.dataset.kind,delBtn.dataset.id);const testBtn=e.target.closest('.testbtn');if(testBtn)testConn(testBtn)});load();
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
@@ -2652,6 +2683,9 @@ class Handler(BaseHTTPRequestHandler):
                 write_dns_nft(load_dns_rules())
                 reload_nft()
                 self.ok({"status": "ok"})
+            elif self.path == "/api/test":
+                data = self.body()
+                self.ok(test_connectivity(data.get("host"), data.get("port"), data.get("timeout")))
             else:
                 self.fail(HTTPStatus.NOT_FOUND, "not found")
         except Exception as e:
