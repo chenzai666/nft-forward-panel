@@ -2862,7 +2862,7 @@ EOF
     fi
     echo "访问地址: ${scheme}://${ip}:${panel_port}"
     echo "用户名: ${panel_user}"
-    (( existing_panel )) || echo "密码: ${panel_pass}"
+    echo "密码: ${panel_pass}"
     log_action "安装/更新 Web 面板: port=${panel_port}"
 }
 
