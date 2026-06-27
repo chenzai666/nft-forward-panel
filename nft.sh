@@ -2272,10 +2272,16 @@ install_panel() {
         panel_host="${panel_host:-0.0.0.0}"
         panel_cert="${panel_cert:-}"
         panel_key="${panel_key:-}"
+        if [[ -z "$panel_cert" && -z "$panel_key" && -f "$PANEL_CERT_DEFAULT" && -f "$PANEL_KEY_DEFAULT" ]]; then
+            panel_cert="$PANEL_CERT_DEFAULT"
+            panel_key="$PANEL_KEY_DEFAULT"
+            info "检测到默认路径证书，已自动恢复 HTTPS 配置。"
+        fi
         info "检测到已安装 Web 面板，本次仅更新面板程序并保留现有配置。"
         echo "端口: ${panel_port}"
         echo "用户名: ${panel_user}"
         echo "监听 IP: ${panel_host}"
+        [[ -n "$panel_cert" && -n "$panel_key" ]] && echo "HTTPS: 已启用"
     else
         read -rp "面板端口 [默认: ${PANEL_PORT_DEFAULT}]: " panel_port
         panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
