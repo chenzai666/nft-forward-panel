@@ -1,0 +1,2662 @@
+#!/usr/bin/env bash
+#
+# nftables 端口转发管理工具 v1.6
+# 交互式管理 DNAT 端口转发规则（支持规则命名 + DNS 动态转发）
+# v1.5: DNS 动态转发去掉手动 IP，域名解析 IP 同时作为 DNAT 目标
+# v1.6: 安装流程默认不清空全局规则，增加 Web 面板管理
+#
+
+# ============== 常量定义 ==============
+CONF_DIR="/etc/nftables.d"
+CONF_FILE="${CONF_DIR}/port-forward.conf"
+DNS_CONF_FILE="${CONF_DIR}/dns-forward.conf"
+DNS_USER_CONF="${CONF_DIR}/dns-forward.rules"
+DNSMASQ_CONF_DIR="/etc/dnsmasq.d"
+DNSMASQ_CONF="${DNSMASQ_CONF_DIR}/dns-forward.conf"
+DNS_SET_SYNC_TIMER="dns-nft-sync.timer"
+DNS_SET_SYNC_SERVICE="dns-nft-sync.service"
+DNS_SET_SYNC_SCRIPT="/usr/local/bin/dns-nft-sync.sh"
+BACKUP_DIR="${CONF_DIR}/backups"
+MAIN_CONF="/etc/nftables.conf"
+SYSCTL_CONF="/etc/sysctl.d/99-nft-forward.conf"
+LOG_FILE="/var/log/nft-forward.log"
+LOGROTATE_CONF="/etc/logrotate.d/nft-forward"
+TABLE_NAME="port_forward"
+PANEL_BIN="/usr/local/bin/nft-forward-panel"
+PANEL_SERVICE="nft-forward-panel.service"
+PANEL_SERVICE_FILE="/etc/systemd/system/${PANEL_SERVICE}"
+PANEL_PORT_DEFAULT="4788"
+PANEL_USER_DEFAULT="admin"
+PANEL_PASS_DEFAULT="admin123"
+
+# ============== 日志函数 ==============
+log_action() {
+    local msg="$1"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+# ============== 输出辅助（用 printf 避免 echo -e 转义副作用） ==============
+info()    { printf '\033[32m[信息]\033[0m %s\n' "$1"; }
+warn()    { printf '\033[33m[警告]\033[0m %s\n' "$1"; }
+err()     { printf '\033[31m[错误]\033[0m %s\n' "$1"; }
+
+# ============== root 权限检查 ==============
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        err "此脚本需要 root 权限运行，请使用 sudo 或 root 用户执行。"
+        exit 1
+    fi
+}
+
+# ============== 输入验证 ==============
+validate_port() {
+    local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" =~ ^0[0-9] ]]; then
+        return 1
+    fi
+    if (( port < 1 || port > 65535 )); then
+        return 1
+    fi
+    return 0
+}
+
+validate_ip() {
+    local ip="$1"
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 1
+    fi
+    if [[ "$ip" =~ (^|\.)0[0-9] ]]; then
+        return 1
+    fi
+    local IFS='.'
+    read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        if (( octet > 255 )); then
+            return 1
+        fi
+    done
+    return 0
+}
+
+sanitize_rule_name() {
+    local name="$1"
+    name="${name//$'\r'/ }"
+    name="${name//$'\n'/ }"
+    name="${name//|/-}"
+    name=$(printf '%s' "$name" | sed -E 's/[[:cntrl:]]//g; s/^[[:space:]]+//; s/[[:space:]]+$//')
+    printf '%s' "${name:0:60}"
+}
+
+# ============== 自动获取本机 IP ==============
+get_local_ip() {
+    local ip
+    ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1) || true
+    if [[ -n "$ip" ]]; then
+        echo "$ip"
+        return
+    fi
+    ip=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[0-9.]+' | head -1) || true
+    if [[ -n "$ip" ]]; then
+        echo "$ip"
+        return
+    fi
+    hostname -I 2>/dev/null | awk '{print $1}' || true
+}
+
+# ============== 发行版检测 ==============
+detect_pkg_manager() {
+    if command -v apt-get &>/dev/null; then
+        echo "apt"
+    elif command -v dnf &>/dev/null; then
+        echo "dnf"
+    elif command -v yum &>/dev/null; then
+        echo "yum"
+    elif command -v pacman &>/dev/null; then
+        echo "pacman"
+    else
+        echo "unknown"
+    fi
+}
+
+# ============== iptables 可用性检测 ==============
+has_iptables() {
+    command -v iptables &>/dev/null && iptables -S &>/dev/null
+}
+
+# ============== 安装并启用 iptables 持久化工具 ==============
+install_iptables_persistent() {
+    # 已安装则直接返回
+    if command -v netfilter-persistent &>/dev/null; then
+        return 0
+    fi
+
+    local pkg_mgr
+    pkg_mgr=$(detect_pkg_manager)
+
+    info "正在安装 iptables 持久化工具..."
+
+    case "$pkg_mgr" in
+        apt)
+            # Debian/Ubuntu: netfilter-persistent + iptables-persistent 插件
+            # DEBIAN_FRONTEND=noninteractive 避免交互询问"是否保存当前规则"
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                netfilter-persistent iptables-persistent 2>/dev/null
+            ;;
+        dnf)
+            dnf install -y iptables-services 2>/dev/null
+            ;;
+        yum)
+            yum install -y iptables-services 2>/dev/null
+            ;;
+        pacman)
+            # Arch 用 iptables-nft 或 iptables；持久化通过 systemd service
+            pacman -Sy --noconfirm iptables 2>/dev/null
+            ;;
+        *)
+            warn "无法识别包管理器，跳过自动安装持久化工具。"
+            return 1
+            ;;
+    esac
+
+    # 安装后启用服务（确保开机自动加载已保存规则）
+    if command -v netfilter-persistent &>/dev/null; then
+        systemctl enable netfilter-persistent 2>/dev/null || true
+        info "已安装并启用 netfilter-persistent。"
+        log_action "安装并启用 netfilter-persistent"
+        return 0
+    fi
+
+    # CentOS/RHEL 的 iptables-services
+    if systemctl list-unit-files 2>/dev/null | grep -q "^iptables.service"; then
+        systemctl enable iptables 2>/dev/null || true
+        info "已启用 iptables.service（CentOS/RHEL 持久化）。"
+        log_action "启用 iptables.service"
+        return 0
+    fi
+
+    warn "持久化工具安装后未能确认可用，请手动检查。"
+    return 1
+}
+
+# ============== iptables 规则持久化 ==============
+try_persist_iptables() {
+    # 优先使用 netfilter-persistent（Debian/Ubuntu 标准工具）
+    if command -v netfilter-persistent &>/dev/null; then
+        if netfilter-persistent save >/dev/null 2>&1; then
+            info "iptables 规则已通过 netfilter-persistent 持久化。"
+            log_action "netfilter-persistent save"
+            return 0
+        fi
+    fi
+
+    # 次选：iptables-save 直接写文件（RHEL/CentOS 风格）
+    if command -v iptables-save &>/dev/null; then
+        if [[ -d /etc/iptables ]]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null && {
+                info "iptables 规则已保存至 /etc/iptables/rules.v4。"
+                log_action "iptables-save > /etc/iptables/rules.v4"
+                return 0
+            }
+        fi
+        if [[ -d /etc/sysconfig ]]; then
+            iptables-save > /etc/sysconfig/iptables 2>/dev/null && {
+                info "iptables 规则已保存至 /etc/sysconfig/iptables。"
+                log_action "iptables-save > /etc/sysconfig/iptables"
+                return 0
+            }
+        fi
+    fi
+
+    # 末选：service iptables save（旧版 CentOS）
+    if command -v service &>/dev/null; then
+        service iptables save >/dev/null 2>&1 && {
+            info "iptables 规则已通过 service iptables save 持久化。"
+            log_action "service iptables save"
+            return 0
+        }
+    fi
+
+    return 1
+}
+
+# ============== 确保 iptables 持久化可用（安装 + 保存） ==============
+# 在添加/删除 iptables 规则后调用此函数
+ensure_iptables_persistent() {
+    # 尝试直接保存
+    if try_persist_iptables; then
+        return 0
+    fi
+
+    # 保存失败，尝试安装持久化工具后再保存
+    warn "未检测到 iptables 持久化工具，尝试自动安装..."
+    if install_iptables_persistent; then
+        if try_persist_iptables; then
+            return 0
+        fi
+    fi
+
+    warn "iptables 规则已生效但未能持久化，重启后将丢失。"
+    warn "请手动安装: apt install netfilter-persistent iptables-persistent"
+    return 1
+}
+
+# ============== 检查目标是否仍被其他规则使用 ==============
+dest_still_used() {
+    local check_ip="$1" check_dport="$2" exclude_lport="$3"
+    local rule lport dip dport
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport dip dport _ <<< "$rule"
+        [[ "$lport" == "$exclude_lport" ]] && continue
+        if [[ "$dip" == "$check_ip" && "$dport" == "$check_dport" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ============== firewalld / iptables 端口放行 ==============
+firewall_open_port() {
+    local lport="$1" dest_ip="$2" dport="$3"
+
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --add-port="${lport}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --add-port="${lport}/udp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        info "已在 firewalld 中放行端口 ${lport} (tcp+udp)。"
+        log_action "firewalld 放行端口 ${lport}"
+        return
+    fi
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        ufw allow "${lport}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${lport}/udp" >/dev/null 2>&1 || true
+        ufw route allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        ufw route allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        info "已在 UFW 中放行端口 ${lport} 及转发到 ${dest_ip}:${dport} (tcp+udp)。"
+        log_action "UFW 放行端口 ${lport} 转发到 ${dest_ip}:${dport}"
+        return
+    fi
+
+    if has_iptables; then
+        iptables -C INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+        iptables -C INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+        info "已在 iptables 中放行: INPUT ${lport}, FORWARD → ${dest_ip}:${dport} (tcp+udp)。"
+        log_action "iptables 放行 INPUT:${lport} FORWARD:${dest_ip}:${dport}"
+        # 自动安装持久化工具并保存
+        ensure_iptables_persistent
+    fi
+}
+
+firewall_close_port() {
+    local lport="$1" dest_ip="$2" dport="$3" force="${4:-}"
+
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --remove-port="${lport}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --remove-port="${lport}/udp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        info "已从 firewalld 中移除端口 ${lport} 的放行规则。"
+        log_action "firewalld 移除端口 ${lport}"
+        return
+    fi
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        yes | ufw delete allow "${lport}/tcp" >/dev/null 2>&1 || true
+        yes | ufw delete allow "${lport}/udp" >/dev/null 2>&1 || true
+        if [[ "$force" == "force" ]] || ! dest_still_used "$dest_ip" "$dport" "$lport"; then
+            yes | ufw route delete allow proto tcp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+            yes | ufw route delete allow proto udp to "${dest_ip}" port "${dport}" >/dev/null 2>&1 || true
+        fi
+        info "已从 UFW 中移除端口 ${lport} 的放行规则。"
+        log_action "UFW 移除端口 ${lport}"
+        return
+    fi
+
+    if has_iptables; then
+        iptables -D INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+        if [[ "$force" == "force" ]] || ! dest_still_used "$dest_ip" "$dport" "$lport"; then
+            iptables -D FORWARD -d "${dest_ip}" -p tcp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+            iptables -D FORWARD -d "${dest_ip}" -p udp --dport "${dport}" -j ACCEPT 2>/dev/null || true
+        fi
+        info "已从 iptables 中移除: INPUT ${lport}, FORWARD → ${dest_ip}:${dport}。"
+        log_action "iptables 移除 INPUT:${lport} FORWARD:${dest_ip}:${dport}"
+        # 删除规则后也持久化
+        ensure_iptables_persistent
+    fi
+}
+
+# ============== 端口占用检测（TCP + UDP） ==============
+check_port_conflict() {
+    local port="$1"
+    local conflict=""
+    if ss -tlnp 2>/dev/null | grep -qE ":${port}\b"; then
+        conflict="TCP"
+    fi
+    if ss -ulnp 2>/dev/null | grep -qE ":${port}\b"; then
+        if [[ -n "$conflict" ]]; then
+            conflict="TCP+UDP"
+        else
+            conflict="UDP"
+        fi
+    fi
+    if [[ -n "$conflict" ]]; then
+        warn "本机端口 ${port} 已被其他服务占用（${conflict}）。"
+        warn "添加转发后，该端口的外部流量将被转发，本地服务可能无法从外部访问。"
+        read -rp "是否仍要继续添加转发规则？[y/N]: " ans
+        if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# ============== 初始化配置文件结构 ==============
+init_conf() {
+    mkdir -p "${CONF_DIR}" "${BACKUP_DIR}" 2>/dev/null || {
+        err "无法创建配置目录 ${CONF_DIR}，请检查权限。"
+        return 1
+    }
+
+    touch "${LOG_FILE}" 2>/dev/null || true
+
+    if [[ ! -f "${LOGROTATE_CONF}" ]]; then
+        cat > "${LOGROTATE_CONF}" <<'LOGROTATE'
+/var/log/nft-forward.log {
+    monthly
+    rotate 6
+    compress
+    missingok
+    notifempty
+}
+LOGROTATE
+    fi
+
+    if [[ ! -f "${MAIN_CONF}" ]]; then
+        cat > "${MAIN_CONF}" <<'NFTCONF'
+#!/usr/sbin/nft -f
+include "/etc/nftables.d/*.conf"
+NFTCONF
+        info "已创建 ${MAIN_CONF}（系统中不存在该文件）。"
+        log_action "创建 ${MAIN_CONF}"
+    elif ! grep -qF 'include "/etc/nftables.d/*.conf"' "${MAIN_CONF}" 2>/dev/null; then
+        echo 'include "/etc/nftables.d/*.conf"' >> "${MAIN_CONF}"
+        info "已在 ${MAIN_CONF} 中添加 include 指令。"
+        log_action "在 ${MAIN_CONF} 中添加 include 指令"
+    fi
+
+    if [[ ! -f "${CONF_FILE}" ]]; then
+        write_conf_file || return 1
+    fi
+}
+
+# ============== 写出配置文件（基于当前 RULES 数组） ==============
+declare -a RULES=()
+
+load_rules() {
+    RULES=()
+    if [[ ! -f "${CONF_FILE}" ]]; then
+        return
+    fi
+    local prev_comment=""
+    while IFS= read -r line; do
+        # 收集注释行
+        if [[ "$line" =~ ^[[:space:]]*#[[:space:]]*(.+)$ ]]; then
+            prev_comment="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ tcp\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
+            local lport="${BASH_REMATCH[1]}" dip="${BASH_REMATCH[2]}" dport="${BASH_REMATCH[3]}"
+            local name="${prev_comment}"
+            RULES+=("${lport}|${dip}|${dport}|${name}")
+            prev_comment=""
+        else
+            prev_comment=""
+        fi
+    done < "${CONF_FILE}"
+}
+
+write_conf_file() {
+    local local_ip
+    local_ip=$(get_local_ip)
+
+    if [[ -z "$local_ip" ]]; then
+        err "无法获取本机 IP 地址，请检查网络配置。"
+        return 1
+    fi
+
+    local tmp_file="${CONF_FILE}.tmp.$$"
+
+    cat > "${tmp_file}" <<EOF
+#!/usr/sbin/nft -f
+
+# --- 本机 IP（自动获取，用于 SNAT 回源）
+define LOCAL_IP = ${local_ip}
+
+table ip ${TABLE_NAME} {
+    # --- PREROUTING (DNAT) ---
+    chain prerouting {
+        type nat hook prerouting priority -100; policy accept;
+EOF
+
+    local rule lport dip dport name
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport dip dport name <<< "$rule"
+        if [[ -n "$name" ]]; then
+            cat >> "${tmp_file}" <<EOF
+
+        # ${name}
+        tcp dport ${lport} dnat to ${dip}:${dport}
+        udp dport ${lport} dnat to ${dip}:${dport}
+EOF
+        else
+            cat >> "${tmp_file}" <<EOF
+
+        # 转发: 本机:${lport} -> ${dip}:${dport}
+        tcp dport ${lport} dnat to ${dip}:${dport}
+        udp dport ${lport} dnat to ${dip}:${dport}
+EOF
+        fi
+    done
+
+    cat >> "${tmp_file}" <<EOF
+    }
+
+    # --- POSTROUTING (SNAT) ---
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+EOF
+
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport dip dport _ <<< "$rule"
+        cat >> "${tmp_file}" <<EOF
+
+        # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为本机 IP
+        ip daddr ${dip} tcp dport ${dport} ct status dnat snat to \$LOCAL_IP
+        ip daddr ${dip} udp dport ${dport} ct status dnat snat to \$LOCAL_IP
+EOF
+    done
+
+    cat >> "${tmp_file}" <<EOF
+    }
+}
+EOF
+
+    mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null || {
+        err "无法写入配置文件 ${CONF_FILE}"
+        rm -f "${tmp_file}" 2>/dev/null || true
+        return 1
+    }
+}
+
+# ============== 重新加载规则 ==============
+reload_rules() {
+    nft flush table ip "${TABLE_NAME}" 2>/dev/null || true
+    nft delete table ip "${TABLE_NAME}" 2>/dev/null || true
+    if ! nft -f "${CONF_FILE}"; then
+        err "加载配置文件失败，请检查 ${CONF_FILE}"
+        return 1
+    fi
+    return 0
+}
+
+# ============== 备份配置 ==============
+backup_conf() {
+    if [[ -f "${CONF_FILE}" ]]; then
+        local ts
+        ts=$(date '+%Y%m%d_%H%M%S')
+        cp "${CONF_FILE}" "${BACKUP_DIR}/port-forward.conf.${ts}" 2>/dev/null || true
+    fi
+}
+
+# ============== 开启内核参数 ==============
+enable_ip_forward() {
+    local current
+    current=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || current="0"
+    if [[ "$current" != "1" ]]; then
+        if sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; then
+            info "已开启 IPv4 转发。"
+        else
+            warn "无法开启 IPv4 转发，请手动执行: sysctl -w net.ipv4.ip_forward=1"
+        fi
+    fi
+
+    mkdir -p "$(dirname "${SYSCTL_CONF}")" 2>/dev/null || true
+    touch "${SYSCTL_CONF}" 2>/dev/null || true
+
+    if grep -qE '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=' "${SYSCTL_CONF}" 2>/dev/null; then
+        sed -i -E 's|^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=.*|net.ipv4.ip_forward=1|' "${SYSCTL_CONF}" 2>/dev/null || true
+    else
+        echo "net.ipv4.ip_forward=1" >> "${SYSCTL_CONF}" 2>/dev/null || true
+    fi
+
+    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
+}
+
+enable_bbr_fq() {
+    modprobe tcp_bbr 2>/dev/null || true
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        warn "内核不支持 BBR，已跳过。"
+        return 0
+    fi
+
+    local cur_cc cur_qd
+    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cur_cc=""
+    cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || cur_qd=""
+
+    if [[ "$cur_cc" == "bbr" && "$cur_qd" == "fq" ]]; then
+        info "BBR + fq 已启用（无需修改）。"
+        return 0
+    fi
+
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+
+    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cur_cc=""
+    cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || cur_qd=""
+
+    if [[ "$cur_cc" == "bbr" && "$cur_qd" == "fq" ]]; then
+        info "已开启 BBR + fq。"
+        log_action "开启 BBR+fq"
+    else
+        warn "BBR+fq 未确认生效（cc=${cur_cc:-?}, qdisc=${cur_qd:-?}）。"
+    fi
+
+    mkdir -p "$(dirname "${SYSCTL_CONF}")" 2>/dev/null || true
+    touch "${SYSCTL_CONF}" 2>/dev/null || true
+
+    if grep -qE '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "${SYSCTL_CONF}"; then
+        sed -i -E 's|^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=.*|net.core.default_qdisc=fq|' "${SYSCTL_CONF}" 2>/dev/null || true
+    else
+        echo "net.core.default_qdisc=fq" >> "${SYSCTL_CONF}" 2>/dev/null || true
+    fi
+
+    if grep -qE '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "${SYSCTL_CONF}"; then
+        sed -i -E 's/^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=.*/net.ipv4.tcp_congestion_control=bbr/' "${SYSCTL_CONF}" 2>/dev/null || true
+    else
+        echo "net.ipv4.tcp_congestion_control=bbr" >> "${SYSCTL_CONF}" 2>/dev/null || true
+    fi
+
+    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
+    info "已持久化 BBR + fq 到 ${SYSCTL_CONF}。"
+    log_action "持久化 BBR+fq 到 ${SYSCTL_CONF}"
+}
+
+# ============== 检测防火墙状态（仅提示） ==============
+check_firewall_status() {
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        info "检测到 firewalld 正在运行，添加转发规则时将自动放行对应端口。"
+    elif command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        info "检测到 UFW 正在运行，添加转发规则时将自动放行对应端口。"
+    elif has_iptables; then
+        info "检测到 iptables 规则集存在，添加转发规则时将自动放行对应端口。"
+    fi
+}
+
+# ============== 诊断/自检 ==============
+do_diagnose() {
+    echo ""
+    echo "========================================"
+    echo "           诊断 / 自检"
+    echo "========================================"
+
+    local ip_fwd
+    ip_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || ip_fwd="未知"
+    if [[ "$ip_fwd" == "1" ]]; then
+        info "IPv4 转发: 已开启"
+    else
+        err  "IPv4 转发: 未开启 (当前值: ${ip_fwd})"
+        echo "  → 修复: 选择菜单【安装 nftables】会自动开启"
+    fi
+
+    if command -v nft &>/dev/null; then
+        info "nftables: 已安装 ($(nft --version 2>/dev/null || echo '未知版本'))"
+    else
+        err  "nftables: 未安装"
+        echo "  → 修复: 选择菜单【安装 nftables】"
+    fi
+
+    local svc_enabled svc_active
+    svc_enabled=$(systemctl is-enabled nftables 2>/dev/null) || svc_enabled="unknown"
+    svc_active=$(systemctl is-active nftables 2>/dev/null) || svc_active="unknown"
+
+    if [[ "$svc_enabled" == "enabled" ]]; then
+        info "nftables 开机启动: 是"
+    else
+        warn "nftables 开机启动: 否（重启后规则可能丢失）"
+        echo "  → 修复: systemctl enable nftables"
+    fi
+
+    if [[ "$svc_active" == "active" ]]; then
+        info "nftables 服务状态: 运行中"
+    else
+        warn "nftables 服务状态: 未运行"
+        echo "  → 修复: systemctl start nftables"
+    fi
+
+    if nft list table ip "${TABLE_NAME}" &>/dev/null; then
+        load_rules
+        info "转发规则表: 已加载（${#RULES[@]} 条转发规则）"
+    else
+        warn "转发规则表: 未加载（可能无规则或服务未启动）"
+    fi
+
+    # ---- iptables 持久化状态 ----
+    echo ""
+    echo "--- iptables 持久化状态 ---"
+    if command -v netfilter-persistent &>/dev/null; then
+        info "netfilter-persistent: 已安装"
+        local nfp_status
+        nfp_status=$(systemctl is-enabled netfilter-persistent 2>/dev/null) || nfp_status="unknown"
+        if [[ "$nfp_status" == "enabled" ]]; then
+            info "netfilter-persistent 开机启动: 是"
+        else
+            warn "netfilter-persistent 开机启动: 否"
+            echo "  → 修复: systemctl enable netfilter-persistent"
+        fi
+        # 检查已保存的规则文件
+        if [[ -f /etc/iptables/rules.v4 ]]; then
+            local rule_count
+            rule_count=$(grep -c '^-' /etc/iptables/rules.v4 2>/dev/null) || rule_count=0
+            info "已保存的 iptables 规则: ${rule_count} 条 (/etc/iptables/rules.v4)"
+        else
+            warn "尚未保存 iptables 规则 (未找到 /etc/iptables/rules.v4)"
+        fi
+    elif systemctl list-unit-files 2>/dev/null | grep -q "^iptables.service"; then
+        local ipt_status
+        ipt_status=$(systemctl is-enabled iptables 2>/dev/null) || ipt_status="unknown"
+        if [[ "$ipt_status" == "enabled" ]]; then
+            info "iptables.service 开机启动: 是"
+        else
+            warn "iptables.service 开机启动: 否"
+            echo "  → 修复: systemctl enable iptables"
+        fi
+    else
+        warn "未检测到 iptables 持久化工具（netfilter-persistent / iptables-persistent）"
+        echo "  → 修复: 选择菜单【安装 iptables-persistent】"
+    fi
+
+    echo ""
+    echo "--- 防火墙状态 ---"
+    local fw_found=false
+
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        fw_found=true
+        info "firewalld: 活跃"
+    fi
+
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        fw_found=true
+        warn "UFW: 活跃（默认会阻止入站连接，可能影响转发）"
+    fi
+
+    if ! $fw_found && has_iptables; then
+        fw_found=true
+        local fwd_policy
+        fwd_policy=$(iptables -S FORWARD 2>/dev/null | grep -- '^-P FORWARD' | awk '{print $3}') || fwd_policy=""
+        if [[ "$fwd_policy" == "DROP" || "$fwd_policy" == "REJECT" ]]; then
+            warn "iptables FORWARD 默认策略: ${fwd_policy}（可能阻止转发流量）"
+        else
+            info "iptables FORWARD 默认策略: ${fwd_policy:-ACCEPT}"
+        fi
+    fi
+
+    if ! $fw_found; then
+        info "未检测到活跃的防火墙 (firewalld / UFW / iptables)"
+    fi
+
+    echo ""
+    echo "--- nftables forward 链 ---"
+    local fwd_chains
+    fwd_chains=$(nft list chains 2>/dev/null | grep -B1 "hook forward" || true)
+    if [[ -n "$fwd_chains" ]]; then
+        if echo "$fwd_chains" | grep -qi "drop"; then
+            warn "检测到 nftables forward 链默认策略为 drop，会阻止所有转发流量。"
+            echo "  查看详情: nft list ruleset | grep -A5 'hook forward'"
+        else
+            info "nftables forward 链: 未发现 drop 策略"
+        fi
+    else
+        info "未检测到 nftables forward 链（正常）"
+    fi
+
+    echo ""
+    echo "--- 配置持久化 ---"
+    if [[ -f "${MAIN_CONF}" ]]; then
+        if grep -qF 'include "/etc/nftables.d/*.conf"' "${MAIN_CONF}" 2>/dev/null; then
+            info "主配置 ${MAIN_CONF}: 已包含 include 指令"
+        else
+            warn "主配置 ${MAIN_CONF}: 缺少 include 指令"
+            echo "  → 修复: 选择菜单【安装 nftables】"
+        fi
+    else
+        warn "主配置 ${MAIN_CONF}: 不存在"
+    fi
+
+    if [[ -f "${CONF_FILE}" ]]; then
+        info "转发配置文件: ${CONF_FILE} 存在"
+    else
+        info "转发配置文件: 尚未创建（添加首条规则时自动生成）"
+    fi
+
+    load_rules
+    load_dns_rules
+    local test_conn=""
+    if [[ ${#RULES[@]} -gt 0 || ${#DNS_RULES[@]} -gt 0 ]]; then
+        read -rp "是否测试目标连通性？[y/N]: " test_conn
+    fi
+
+    # 普通转发连通性测试
+    if [[ ${#RULES[@]} -gt 0 ]]; then
+        if [[ "$test_conn" =~ ^[Yy]$ ]]; then
+        local rule lport dip dport name
+        for rule in "${RULES[@]}"; do
+            IFS='|' read -r lport dip dport name <<< "$rule"
+            printf "  [%s] %s:%s (TCP) ... " "${name:-unnamed}" "$dip" "$dport"
+                if timeout 3 bash -c ">/dev/tcp/${dip}/${dport}" 2>/dev/null; then
+                    printf "\033[32m通\033[0m\n"
+                else
+                    printf "\033[31m不通或超时\033[0m\n"
+                fi
+            done
+        fi
+    fi
+
+    # DNS 动态转发状态
+    load_dns_rules
+    if [[ ${#DNS_RULES[@]} -gt 0 ]]; then
+        echo ""
+        echo "--- DNS 动态转发 ---"
+        info "DNS 转发规则: ${#DNS_RULES[@]} 条"
+        if nft list table ip port_forward_dns &>/dev/null; then
+            info "DNS 转发表: 已加载"
+        else
+            warn "DNS 转发表: 未加载"
+            echo "  → 修复: 进入菜单 [8] → [4] 手动同步"
+        fi
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${DNS_SET_SYNC_TIMER}"; then
+            if systemctl is-active --quiet "${DNS_SET_SYNC_TIMER}" 2>/dev/null; then
+                info "DNS 定时同步: 已启用（每5分钟）"
+            else
+                warn "DNS 定时同步: 已安装但未运行"
+                echo "  → 修复: systemctl start ${DNS_SET_SYNC_TIMER}"
+            fi
+        else
+            warn "DNS 定时同步: 未安装"
+            echo "  → 修复: 进入菜单 [8] → [1] 添加规则时会提示安装"
+        fi
+        # 显示各域名解析状态 + 连通性测试
+        local rule domain lport dport set_name ip_list
+        for rule in "${DNS_RULES[@]}"; do
+            IFS='|' read -r domain lport dport set_name <<< "$rule"
+            ip_list=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//') || ip_list=""
+            if [[ -n "$ip_list" ]]; then
+                info "  ${domain}:${lport} -> ${ip_list}:${dport}"
+                # 连通性测试（对每个解析 IP）
+                if [[ "$test_conn" =~ ^[Yy]$ ]]; then
+                    local IFS_BAK="$IFS"
+                    IFS=','
+                    for rip in $ip_list; do
+                        printf "    [%s:%s] TCP ... " "$rip" "$dport"
+                        if timeout 3 bash -c ">/dev/tcp/${rip}/${dport}" 2>/dev/null; then
+                            printf "\033[32m通\033[0m\n"
+                        else
+                            printf "\033[31m不通或超时\033[0m\n"
+                        fi
+                    done
+                    IFS="$IFS_BAK"
+                fi
+            else
+                warn "  ${domain}:${lport} -> [未解析]:${dport}"
+            fi
+        done
+    fi
+
+    echo ""
+}
+
+# ====================================================
+# 功能 1：安装 nftables
+# ====================================================
+do_install() {
+    echo ""
+    if command -v nft &>/dev/null; then
+        info "nftables 已安装。"
+        nft --version 2>/dev/null || true
+        echo ""
+        info "将只初始化本脚本自己的配置，不会清空全局 nftables 规则集。"
+
+        enable_ip_forward
+        read -rp "是否启用 BBR + fq 网络优化？[y/N]: " ans_bbr
+        if [[ "$ans_bbr" =~ ^[Yy]$ ]]; then
+            enable_bbr_fq
+        else
+            info "已跳过 BBR + fq。"
+        fi
+        check_firewall_status
+        init_conf
+
+        if ! nft -f "${CONF_FILE}"; then
+            err "加载 ${CONF_FILE} 失败，请检查配置。"
+            return
+        fi
+
+        if systemctl enable --now nftables 2>/dev/null; then
+            info "已启用 nftables 服务。"
+        else
+            warn "nftables 服务启用失败，请手动执行: systemctl enable --now nftables"
+        fi
+
+        # 若当前使用 iptables 管理防火墙，顺便确保持久化工具已就绪
+        if has_iptables && ! systemctl is-active --quiet firewalld 2>/dev/null; then
+            info "检测到 iptables，正在确保持久化工具已安装..."
+            install_iptables_persistent || true
+        fi
+
+        info "初始化完成。"
+        return
+    fi
+
+    info "未检测到 nftables，准备安装..."
+    local pkg_mgr
+    pkg_mgr=$(detect_pkg_manager)
+
+    case "$pkg_mgr" in
+        apt)
+            apt-get update -y && apt-get install -y nftables
+            ;;
+        dnf)
+            dnf install -y nftables
+            ;;
+        yum)
+            yum install -y nftables
+            ;;
+        pacman)
+            pacman -Sy --noconfirm nftables
+            ;;
+        *)
+            err "无法识别包管理器，请手动安装 nftables。"
+            return
+            ;;
+    esac
+
+    if ! command -v nft &>/dev/null; then
+        err "安装失败，请手动安装 nftables。"
+        return
+    fi
+
+    info "nftables 安装成功。"
+    nft --version 2>/dev/null || true
+    log_action "安装 nftables"
+
+    enable_ip_forward
+    read -rp "是否启用 BBR + fq 网络优化？[y/N]: " ans_bbr
+    if [[ "$ans_bbr" =~ ^[Yy]$ ]]; then
+        enable_bbr_fq
+    else
+        info "已跳过 BBR + fq。"
+    fi
+    check_firewall_status
+    init_conf
+
+    if systemctl enable --now nftables 2>/dev/null; then
+        info "已启用 nftables 服务。"
+    else
+        warn "nftables 服务启用失败，请手动执行: systemctl enable --now nftables"
+    fi
+
+    # 安装 iptables 持久化工具
+    if has_iptables && ! systemctl is-active --quiet firewalld 2>/dev/null; then
+        info "正在安装 iptables 持久化工具..."
+        install_iptables_persistent || true
+    fi
+
+    info "安装与初始化完成。"
+}
+
+# ====================================================
+# 功能 1.5：单独安装 iptables-persistent
+# ====================================================
+do_install_iptables_persistent() {
+    echo ""
+    if command -v netfilter-persistent &>/dev/null; then
+        info "netfilter-persistent 已安装。"
+        local status
+        status=$(systemctl is-enabled netfilter-persistent 2>/dev/null) || status="unknown"
+        info "开机自启状态: ${status}"
+        read -rp "是否立即保存当前 iptables 规则？[Y/n]: " ans
+        if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+            try_persist_iptables
+        fi
+        return
+    fi
+
+    install_iptables_persistent
+
+    # 安装后立即保存当前规则
+    if command -v netfilter-persistent &>/dev/null || \
+       systemctl list-unit-files 2>/dev/null | grep -q "^iptables.service"; then
+        info "正在保存当前 iptables 规则..."
+        try_persist_iptables || warn "保存失败，请手动执行: netfilter-persistent save"
+    fi
+}
+
+# ====================================================
+# 功能 2：查看现有端口转发
+# ====================================================
+do_list() {
+    echo ""
+    load_rules
+    load_dns_rules
+
+    if [[ ${#RULES[@]} -eq 0 && ${#DNS_RULES[@]} -eq 0 ]]; then
+        info "当前没有端口转发规则。"
+        return
+    fi
+
+    # 普通转发规则
+    if [[ ${#RULES[@]} -gt 0 ]]; then
+        printf "\n\033[1m%-6s %-20s %-10s %-10s    %-22s\033[0m\n" "序号" "名称" "协议" "本机端口" "目标地址"
+        echo "────────────────────────────────────────────────────────────────────"
+
+        local idx=1
+        local rule lport dip dport name
+        for rule in "${RULES[@]}"; do
+            IFS='|' read -r lport dip dport name <<< "$rule"
+            printf "%-6s %-20s %-10s %-10s -> %-22s\n" \
+                "$idx" "${name:-（未命名）}" "tcp+udp" "$lport" "${dip}:${dport}"
+            ((idx++))
+        done
+        echo ""
+    fi
+
+    # DNS 动态转发规则
+    if [[ ${#DNS_RULES[@]} -gt 0 ]]; then
+        printf "\n\033[1m--- DNS 动态转发（域名自动解析） ---\033[0m\n"
+        printf "\033[1m%-6s %-20s %-10s %-10s    %-22s\033[0m\n" "序号" "域名" "协议" "监听端口" "目标端口"
+        echo "────────────────────────────────────────────────────────────────────"
+
+        local idx=1
+        local rule domain lport dport set_name ip_list
+        for rule in "${DNS_RULES[@]}"; do
+            IFS='|' read -r domain lport dport set_name <<< "$rule"
+            ip_list=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//') || ip_list=""
+            local target_str
+            if [[ -n "$ip_list" ]]; then
+                target_str="${ip_list}:${dport}"
+            else
+                target_str="\033[33m[未解析]:${dport}\033[0m"
+            fi
+            printf "%-6s %-20s %-10s %-10s -> %-22b\n" \
+                "$idx" "${domain}" "tcp+udp" "$lport" "$target_str"
+            ((idx++))
+        done
+        echo ""
+
+        # 同步状态
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${DNS_SET_SYNC_TIMER}"; then
+            if systemctl is-active --quiet "${DNS_SET_SYNC_TIMER}" 2>/dev/null; then
+                info "DNS 定时同步: 已启用（每5分钟）"
+            else
+                warn "DNS 定时同步: 未运行"
+            fi
+        fi
+    fi
+}
+
+# ====================================================
+# 功能 3：新增端口转发
+# ====================================================
+do_add() {
+    echo ""
+    if ! command -v nft &>/dev/null; then
+        err "nftables 未安装，请先选择 [1] 安装。"
+        return
+    fi
+
+    init_conf || return
+    enable_ip_forward
+    load_rules
+
+    local local_ip
+    local_ip=$(get_local_ip)
+    if [[ -z "$local_ip" ]]; then
+        err "无法获取本机 IP 地址，请检查网络配置。"
+        return
+    fi
+
+    local lport
+    while true; do
+        read -rp "请输入本机监听端口 (1-65535): " lport
+        if validate_port "$lport"; then
+            break
+        fi
+        err "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    local rule rp
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r rp _ _ _ <<< "$rule"
+        if [[ "$rp" == "$lport" ]]; then
+            err "本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
+            return
+        fi
+    done
+
+    if ! check_port_conflict "$lport"; then
+        info "已取消。"
+        return
+    fi
+
+    local dip
+    while true; do
+        read -rp "请输入目标 IP 地址: " dip
+        if validate_ip "$dip"; then
+            break
+        fi
+        err "IP 地址格式无效，请重新输入（如 192.168.1.100）。"
+    done
+
+    local dport
+    while true; do
+        read -rp "请输入目标端口 (1-65535) [默认: ${lport}]: " dport
+        dport="${dport:-$lport}"
+        if validate_port "$dport"; then
+            break
+        fi
+        err "端口无效，请输入 1-65535 之间的数字。"
+    done
+
+    local name
+    read -rp "为此规则设置一个名称，方便标识（如 gadi-server, wx-bot）[默认: 不命名]: " name
+    name=$(sanitize_rule_name "$name")
+
+    echo ""
+    echo "即将添加转发规则:"
+    echo "  名称: ${name:-（未命名）}"
+    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    read -rp "确认添加？[Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        info "已取消。"
+        return
+    fi
+
+    backup_conf
+    RULES+=("${lport}|${dip}|${dport}|${name}")
+    if ! write_conf_file; then
+        return
+    fi
+
+    if reload_rules; then
+        firewall_open_port "$lport" "$dip" "$dport"
+        info "转发规则添加成功: [${name:-unnamed}] ${lport} → ${dip}:${dport}"
+        log_action "新增转发: [${name:-unnamed}] ${lport} -> ${dip}:${dport}"
+        info "若转发不通，请使用菜单中的【诊断/自检】排查。"
+    else
+        err "规则加载失败，请检查配置。"
+    fi
+}
+
+# ====================================================
+# 功能 4：删除端口转发
+# ====================================================
+do_delete() {
+    echo ""
+    if ! command -v nft &>/dev/null; then
+        err "nftables 未安装，请先选择 [1] 安装。"
+        return
+    fi
+
+    load_rules
+
+    if [[ ${#RULES[@]} -eq 0 ]]; then
+        info "当前没有端口转发规则，无需删除。"
+        return
+    fi
+
+    printf "\n\033[1m%-6s %-20s %-10s %-10s    %-22s\033[0m\n" "序号" "名称" "协议" "本机端口" "目标地址"
+    echo "────────────────────────────────────────────────────────────────────"
+
+    local idx=1
+    local rule lport dip dport name
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport dip dport name <<< "$rule"
+        printf "%-6s %-20s %-10s %-10s -> %-22s\n" \
+            "$idx" "${name:-（未命名）}" "tcp+udp" "$lport" "${dip}:${dport}"
+        ((idx++))
+    done
+    echo ""
+
+    local choice
+    read -rp "请输入要删除的序号 (0 取消): " choice
+
+    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+        info "已取消。"
+        return
+    fi
+
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#RULES[@]} )); then
+        err "无效的序号。"
+        return
+    fi
+
+    local target="${RULES[$((choice-1))]}"
+    IFS='|' read -r lport dip dport name <<< "$target"
+
+    echo "即将删除转发规则:"
+    echo "  名称: ${name:-（未命名）}"
+    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    read -rp "确认删除？[Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        info "已取消。"
+        return
+    fi
+
+    backup_conf
+    unset 'RULES[$((choice-1))]'
+    RULES=("${RULES[@]}")
+
+    if ! write_conf_file; then
+        return
+    fi
+
+    if reload_rules; then
+        firewall_close_port "$lport" "$dip" "$dport"
+        info "转发规则已删除: [${name:-unnamed}] ${lport} → ${dip}:${dport}"
+        log_action "删除转发: [${name:-unnamed}] ${lport} -> ${dip}:${dport}"
+    else
+        err "规则加载失败，请检查配置。"
+    fi
+}
+
+# ============== DNS 动态转发规则 ==============
+# 格式: domain|lport|dport|set_name
+# domain: 远程目标域名（自动解析 IP，IP 变化时自动更新 DNAT 规则）
+# lport:  本机监听端口
+# dport:  远程目标端口
+# set_name: nftables set 名称（存储域名当前解析出的 IP，用于展示和去重）
+declare -a DNS_RULES=()
+
+load_dns_rules() {
+    DNS_RULES=()
+    if [[ ! -f "${DNS_USER_CONF}" ]]; then
+        return
+    fi
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+        DNS_RULES+=("$line")
+    done < "${DNS_USER_CONF}"
+}
+
+write_dns_user_conf() {
+    mkdir -p "${CONF_DIR}" 2>/dev/null
+    local tmp_file="${DNS_USER_CONF}.tmp.$$"
+    : > "${tmp_file}" 2>/dev/null || {
+        err "无法创建临时文件 ${tmp_file}"
+        return 1
+    }
+    local rule
+    for rule in "${DNS_RULES[@]}"; do
+        echo "$rule" >> "${tmp_file}"
+    done
+    mv -f "${tmp_file}" "${DNS_USER_CONF}" 2>/dev/null || {
+        err "无法写入 ${DNS_USER_CONF}"
+        rm -f "${tmp_file}" 2>/dev/null || true
+        return 1
+    }
+    return 0
+}
+# ============== 备份 DNS 配置 ==============
+backup_dns_conf() {
+    if [[ -f "${DNS_USER_CONF}" ]]; then
+        local ts
+        ts=$(date '+%Y%m%d_%H%M%S')
+        cp "${DNS_USER_CONF}" "${BACKUP_DIR}/dns-forward.rules.${ts}" 2>/dev/null || true
+    fi
+}
+
+# ============== 写出 DNS 转发 nftables 配置 ==============
+# DNAT 规则的目标 IP 由 sync_dns_to_nftset 动态生成并追加到此文件
+# 此函数只生成 table/set/chain 骨架结构
+write_dns_nft_conf() {
+    local local_ip
+    local_ip=$(get_local_ip)
+    [[ -z "$local_ip" ]] && local_ip="0.0.0.0"
+
+    local tmp_file="${DNS_CONF_FILE}.tmp.$$"
+
+    cat > "${tmp_file}" <<EOF
+#!/usr/sbin/nft -f
+
+# DNS 动态转发 - nftables 配置（骨架 + 动态规则）
+# 自动生成，请勿手动修改
+# 本机 IP: ${local_ip}
+# 注意: DNAT 规则由同步脚本根据域名解析动态生成，修改此文件会被覆盖
+
+table ip port_forward_dns {
+EOF
+
+    if [[ ${#DNS_RULES[@]} -eq 0 ]]; then
+        cat >> "${tmp_file}" <<'EOF'
+}
+EOF
+        mv -f "${tmp_file}" "${DNS_CONF_FILE}" 2>/dev/null || {
+            err "无法写入 ${DNS_CONF_FILE}"
+            rm -f "${tmp_file}" 2>/dev/null || true
+            return 1
+        }
+        return 0
+    fi
+
+    # 生成 set 定义（存储域名解析出的 IP）
+    local rule domain lport dport set_name
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r domain lport dport set_name <<< "$rule"
+        cat >> "${tmp_file}" <<EOF
+    set ${set_name} {
+        type ipv4_addr
+        size 65536
+        flags interval
+    }
+EOF
+    done
+
+    cat >> "${tmp_file}" <<'EOF'
+
+    # --- PREROUTING (DNAT) ---
+    chain dns_prerouting {
+        type nat hook prerouting priority -100; policy accept;
+EOF
+
+    # DNAT 规则由 generate_dns_dnat_rules 生成并追加
+    # 格式: tcp dport <lport> dnat to <resolved_ip>:<dport>
+
+    cat >> "${tmp_file}" <<'EOF'
+
+    }
+
+    # --- POSTROUTING (SNAT 回源) ---
+    chain dns_postrouting {
+        type nat hook postrouting priority 100; policy accept;
+EOF
+
+    # SNAT 规则也由 generate_dns_dnat_rules 动态追加
+
+    cat >> "${tmp_file}" <<'EOF'
+
+    }
+}
+EOF
+
+    mv -f "${tmp_file}" "${DNS_CONF_FILE}" 2>/dev/null || {
+        err "无法写入 ${DNS_CONF_FILE}"
+        rm -f "${tmp_file}" 2>/dev/null || true
+        return 1
+    }
+    return 0
+}
+
+# ============== 根据 set 中的 IP 动态生成 DNAT/SNAT 规则并重新加载 ==============
+generate_dns_dnat_rules() {
+    if [[ ${#DNS_RULES[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    local local_ip
+    local_ip=$(get_local_ip)
+    [[ -z "$local_ip" ]] && local_ip="0.0.0.0"
+
+    local tmp_file="${DNS_CONF_FILE}.tmp.$$"
+
+    cat > "${tmp_file}" <<EOF
+#!/usr/sbin/nft -f
+# DNS 动态转发 - 完整配置（含动态 DNAT 规则）
+# 自动生成，请勿手动修改
+# 本机 IP: ${local_ip}
+
+table ip port_forward_dns {
+EOF
+
+    # set 定义
+    local rule domain lport dport set_name
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r domain lport dport set_name <<< "$rule"
+        cat >> "${tmp_file}" <<EOF
+    set ${set_name} {
+        type ipv4_addr
+        size 65536
+        flags interval
+    }
+EOF
+    done
+
+    cat >> "${tmp_file}" <<'EOF'
+
+    chain dns_prerouting {
+        type nat hook prerouting priority -100; policy accept;
+EOF
+
+    # 为每条规则，从 set 中读取 IP 生成 DNAT
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r domain lport dport set_name <<< "$rule"
+
+        # 读取 set 中当前所有 IP
+        local resolved_ips
+        resolved_ips=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u) || true
+
+        if [[ -n "$resolved_ips" ]]; then
+            while IFS= read -r rip; do
+                [[ -z "$rip" ]] && continue
+                cat >> "${tmp_file}" <<EOF
+        # ${domain}:${lport} -> ${rip}:${dport}
+        tcp dport ${lport} dnat to ${rip}:${dport}
+        udp dport ${lport} dnat to ${rip}:${dport}
+EOF
+            done <<< "$resolved_ips"
+        else
+            # set 中没有 IP，写一条注释占位
+            cat >> "${tmp_file}" <<EOF
+        # ${domain}:${lport} -> [待解析:${dport}]
+EOF
+        fi
+    done
+
+    cat >> "${tmp_file}" <<'EOF'
+
+    }
+
+    chain dns_postrouting {
+        type nat hook postrouting priority 100; policy accept;
+EOF
+
+    # SNAT 回源规则
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r domain lport dport set_name <<< "$rule"
+
+        local resolved_ips
+        resolved_ips=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u) || true
+
+        if [[ -n "$resolved_ips" ]]; then
+            while IFS= read -r rip; do
+                [[ -z "$rip" ]] && continue
+                cat >> "${tmp_file}" <<EOF
+        # 回源: ${domain} -> ${rip}:${dport}
+        ip daddr ${rip} tcp dport ${dport} ct status dnat snat to ${local_ip}
+        ip daddr ${rip} udp dport ${dport} ct status dnat snat to ${local_ip}
+EOF
+            done <<< "$resolved_ips"
+        fi
+    done
+
+    cat >> "${tmp_file}" <<'EOF'
+
+    }
+}
+EOF
+
+    mv -f "${tmp_file}" "${DNS_CONF_FILE}" 2>/dev/null || {
+        err "无法写入 ${DNS_CONF_FILE}"
+        rm -f "${tmp_file}" 2>/dev/null || true
+        return 1
+    }
+    return 0
+}
+
+# ============== 写出 dnsmasq 配置 ==============
+write_dnsmasq_conf() {
+    mkdir -p "${DNSMASQ_CONF_DIR}" 2>/dev/null || {
+        err "无法创建目录 ${DNSMASQ_CONF_DIR}"
+        return 1
+    }
+
+    local tmp_file="${DNSMASQ_CONF}.tmp.$$"
+    {
+        echo "# DNS 动态转发 - dnsmasq 配置"
+        echo "# 自动生成，请勿手动修改"
+        echo "# 使用 nftset= 指令自动将域名解析 IP 写入 nftables set"
+        echo ""
+
+        local rule domain set_name
+        for rule in "${DNS_RULES[@]}"; do
+            IFS='|' read -r domain _ _ set_name <<< "$rule"
+            # nftset= 语法: nftset=/<domain>/[4|6]#<table>#<set>
+            # 在 dnsmasq 2.87+ 支持；旧版用定时同步脚本替代
+            echo "# nftset=/${domain}/4#ip#port_forward_dns#${set_name}"
+            echo "# 注: 若 dnsmasq 不支持 nftset 指令，请使用菜单[4]手动同步或等待定时器"
+        done
+    } > "${tmp_file}"
+
+    mv -f "${tmp_file}" "${DNSMASQ_CONF}" 2>/dev/null || {
+        err "无法写入 ${DNSMASQ_CONF}"
+        rm -f "${tmp_file}" 2>/dev/null || true
+        return 1
+    }
+    return 0
+}
+
+# ============== 安装并启动 dnsmasq ==============
+install_dnsmasq() {
+    if command -v dnsmasq &>/dev/null; then
+        info "dnsmasq 已安装。"
+    else
+        local pkg_mgr
+        pkg_mgr=$(detect_pkg_manager)
+        case "$pkg_mgr" in
+            apt)
+                DEBIAN_FRONTEND=noninteractive apt-get install -y dnsmasq 2>/dev/null
+                ;;
+            dnf)
+                dnf install -y dnsmasq 2>/dev/null
+                ;;
+            yum)
+                yum install -y dnsmasq 2>/dev/null
+                ;;
+            pacman)
+                pacman -Sy --noconfirm dnsmasq 2>/dev/null
+                ;;
+            *)
+                err "无法识别包管理器，请手动安装 dnsmasq。"
+                return 1
+                ;;
+        esac
+        if ! command -v dnsmasq &>/dev/null; then
+            err "dnsmasq 安装失败。"
+            return 1
+        fi
+        info "dnsmasq 安装成功。"
+    fi
+
+    # 确保 conf-dir 包含我们的配置目录
+    if [[ -f /etc/dnsmasq.conf ]] && ! grep -q "^conf-dir=/etc/dnsmasq.d" /etc/dnsmasq.conf 2>/dev/null; then
+        echo 'conf-dir=/etc/dnsmasq.d/,*.conf' >> /etc/dnsmasq.conf
+        info "已在 /etc/dnsmasq.conf 添加 conf-dir 指令。"
+    fi
+
+    if systemctl restart dnsmasq 2>/dev/null; then
+        info "dnsmasq 服务已启动。"
+    else
+        warn "dnsmasq 启动失败，运行配置测试:"
+        dnsmasq --test 2>&1 | head -5
+        return 1
+    fi
+    systemctl enable dnsmasq 2>/dev/null || true
+    info "dnsmasq 已设为开机自启。"
+    log_action "安装并启动 dnsmasq"
+    return 0
+}
+
+# ============== DNS 转发防火墙放行 ==============
+firewall_open_dns_port() {
+    local lport="$1"
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+        firewall-cmd --add-port="${lport}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --add-port="${lport}/udp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        info "firewalld 放行端口 ${lport}。"
+        log_action "firewalld 放行 DNS转发端口 ${lport}"
+        return
+    fi
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
+        ufw allow "${lport}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${lport}/udp" >/dev/null 2>&1 || true
+        info "UFW 放行端口 ${lport}。"
+        log_action "UFW 放行 DNS转发端口 ${lport}"
+        return
+    fi
+    if has_iptables; then
+        iptables -C INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p tcp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+        iptables -C INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT -p udp --dport "${lport}" -j ACCEPT 2>/dev/null || true
+        info "iptables 放行端口 ${lport} (tcp+udp)。"
+        log_action "iptables 放行 DNS转发端口 ${lport}"
+        ensure_iptables_persistent
+    fi
+}
+
+# ============== 同步 DNS 到 nftables set 并重新生成 DNAT 规则 ==============
+sync_dns_to_nftset() {
+    if [[ ${#DNS_RULES[@]} -eq 0 ]]; then
+        info "没有 DNS 转发规则，无需同步。"
+        return 0
+    fi
+
+    echo ""
+    info "开始 DNS 解析并同步到 nftables set..."
+
+    local rule domain lport dport set_name
+    local resolved_ips old_ips
+    local changed=false
+
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r domain lport dport set_name <<< "$rule"
+
+        # 确保 set 存在（先尝试加载，再检查）
+        if ! nft list set ip port_forward_dns "${set_name}" &>/dev/null 2>&1; then
+            # set 不存在，先确保配置文件存在且加载
+            if [[ ! -f "${DNS_CONF_FILE}" ]]; then
+                warn "DNS 配置文件不存在，正在生成..."
+                write_dns_nft_conf || { warn "生成 DNS 配置失败，跳过 ${domain}"; continue; }
+            fi
+            local nft_err
+            nft_err=$(nft -f "${DNS_CONF_FILE}" 2>&1)
+            if [[ $? -ne 0 ]]; then
+                warn "加载 DNS 配置失败: ${DNS_CONF_FILE}"
+                warn "错误详情: ${nft_err}"
+                warn "尝试跳过...（可手动运行: nft -f ${DNS_CONF_FILE}）"
+                continue
+            fi
+        fi
+
+        # 解析域名
+        resolved_ips=$(getent hosts "${domain}" 2>/dev/null | awk '{print $1}' | sort -u) || true
+
+        if [[ -z "$resolved_ips" ]]; then
+            warn "无法解析域名: ${domain}"
+            continue
+        fi
+
+        # 获取当前 set 中的旧 IP
+        old_ips=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u) || old_ips=""
+
+        # 差量计算
+        local new_ips removed_ips
+        new_ips=$(comm -13 <(echo "$old_ips") <(echo "$resolved_ips") 2>/dev/null) || new_ips=""
+        removed_ips=$(comm -23 <(echo "$old_ips") <(echo "$resolved_ips") 2>/dev/null) || removed_ips=""
+
+        # 移除已不在 DNS 记录中的 IP
+        if [[ -n "$removed_ips" ]]; then
+            while IFS= read -r ip; do
+                [[ -z "$ip" ]] && continue
+                [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+                nft delete element ip port_forward_dns "${set_name}" "{ ${ip} }" 2>/dev/null || true
+            done <<< "$removed_ips"
+            printf "  \033[33m[-]\033[0m ${domain}: 移除 %s\n" "$(echo "$removed_ips" | tr '\n' ' ')"
+            changed=true
+        fi
+
+        # 添加新解析出的 IP
+        if [[ -n "$new_ips" ]]; then
+            local ip_list
+            ip_list=$(echo "$new_ips" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
+            if [[ -n "$ip_list" ]]; then
+                nft add element ip port_forward_dns "${set_name}" "{ ${ip_list} }" 2>/dev/null
+                printf "  \033[32m[+]\033[0m ${domain}: 添加 %s\n" "$ip_list"
+                changed=true
+            fi
+        fi
+
+        printf "  \033[36m[*]\033[0m ${domain}:${lport} -> [解析IP]:${dport}  IPs: %s\n" "$(echo "$resolved_ips" | tr '\n' ' ' | sed 's/ $//')"
+        log_action "DNS sync: ${domain}:${lport} -> :${dport} [$(echo "$resolved_ips" | tr '\n' ',')]"
+    done
+
+    if $changed; then
+        # IP 有变化，重新生成 DNAT 规则并加载
+        info "IP 发生变化，正在重新生成 DNAT 规则..."
+        if generate_dns_dnat_rules; then
+            nft -f "${DNS_CONF_FILE}" 2>/dev/null && {
+                info "DNAT 规则已更新。"
+            } || {
+                warn "重新加载 DNAT 规则失败，可手动运行: nft -f ${DNS_CONF_FILE}"
+            }
+        fi
+    else
+        info "DNS 解析无变化（所有 IP 均已存在）。"
+    fi
+}
+
+# ============== 重载 DNS nftables 配置 ==============
+reload_dns_rules() {
+    nft flush table ip port_forward_dns 2>/dev/null || true
+    nft delete table ip port_forward_dns 2>/dev/null || true
+    if [[ -f "${DNS_CONF_FILE}" ]] && ! nft -f "${DNS_CONF_FILE}"; then
+        err "加载 DNS nftables 配置失败。"
+        return 1
+    fi
+    return 0
+}
+
+# ============== 安装 DNS 定时同步服务 ==============
+install_dns_sync_timer() {
+    cat > "${DNS_SET_SYNC_SCRIPT}" <<'SYNC_SCRIPT'
+#!/usr/bin/env bash
+# DNS -> nftables set 同步 + DNAT 规则动态生成（自动生成）
+# 用法: dns-nft-sync.sh
+
+CONF_USER="/etc/nftables.d/dns-forward.rules"
+CONF_NFT="/etc/nftables.d/dns-forward.conf"
+LOG="/var/log/nft-dns-sync.log"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG" 2>/dev/null || true; }
+
+[[ ! -f "$CONF_USER" ]] && exit 0
+
+local_ip=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1) || local_ip="127.0.0.1"
+
+# 第一遍：更新 set 中的 IP
+changed=0
+while IFS='|' read -r domain lport dport set_name; do
+    [[ "$domain" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "$domain" ]] && continue
+
+    resolved=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u) || continue
+    [[ -z "$resolved" ]] && { log "failed to resolve: $domain"; continue; }
+
+    # 确保 set 存在
+    nft list set ip port_forward_dns "${set_name}" &>/dev/null 2>&1 || {
+        nft -f "${CONF_NFT}" 2>/dev/null
+    }
+
+    old=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u) || old=""
+
+    # 差量更新 set
+    for ip in $resolved; do
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+        if ! echo "$old" | grep -qF "$ip"; then
+            nft add element ip port_forward_dns "${set_name}" "{ ${ip} }" 2>/dev/null || true
+            changed=1
+            log "added $ip to $set_name ($domain)"
+        fi
+    done
+
+    # 移除不再解析到的旧 IP
+    if [[ -n "$old" ]]; then
+        while IFS= read -r old_ip; do
+            [[ -z "$old_ip" ]] && continue
+            if ! echo "$resolved" | grep -qF "$old_ip"; then
+                nft delete element ip port_forward_dns "${set_name}" "{ ${old_ip} }" 2>/dev/null || true
+                changed=1
+                log "removed $old_ip from $set_name ($domain)"
+            fi
+        done <<< "$old"
+    fi
+done < "$CONF_USER"
+
+# 第二遍：如果有 IP 变化，重新生成 DNAT 规则并重载
+if [[ "$changed" -eq 1 ]]; then
+    tmp="${CONF_NFT}.tmp.$$"
+    {
+        echo "#!/usr/sbin/nft -f"
+        echo "# DNS 动态转发 - 自动生成 $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# 本机 IP: ${local_ip}"
+        echo ""
+        echo "table ip port_forward_dns {"
+
+        # set 定义
+        while IFS='|' read -r domain lport dport set_name; do
+            [[ "$domain" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$domain" ]] && continue
+            echo "    set ${set_name} { type ipv4_addr; size 65536; flags interval; }"
+        done < "$CONF_USER"
+
+        echo ""
+        echo "    chain dns_prerouting { type nat hook prerouting priority -100; policy accept;"
+
+        # DNAT 规则
+        while IFS='|' read -r domain lport dport set_name; do
+            [[ "$domain" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$domain" ]] && continue
+            ips=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u) || continue
+            for rip in $ips; do
+                echo "        tcp dport ${lport} dnat to ${rip}:${dport}"
+                echo "        udp dport ${lport} dnat to ${rip}:${dport}"
+            done
+        done < "$CONF_USER"
+
+        echo ""
+        echo "    chain dns_postrouting { type nat hook postrouting priority 100; policy accept;"
+
+        # SNAT 规则
+        while IFS='|' read -r domain lport dport set_name; do
+            [[ "$domain" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$domain" ]] && continue
+            ips=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u) || continue
+            for rip in $ips; do
+                echo "        ip daddr ${rip} tcp dport ${dport} ct status dnat snat to ${local_ip}"
+                echo "        ip daddr ${rip} udp dport ${dport} ct status dnat snat to ${local_ip}"
+            done
+        done < "$CONF_USER"
+
+        echo ""
+        echo "    }"
+        echo "}"
+    } > "$tmp"
+
+    mv -f "$tmp" "${CONF_NFT}" 2>/dev/null && {
+        nft -f "${CONF_NFT}" 2>/dev/null
+        log "DNAT rules regenerated and reloaded"
+    }
+fi
+SYNC_SCRIPT
+
+    chmod +x "${DNS_SET_SYNC_SCRIPT}"
+
+    cat > "/etc/systemd/system/${DNS_SET_SYNC_SERVICE}" <<EOF
+[Unit]
+Description=DNS -> nftables set sync
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${DNS_SET_SYNC_SCRIPT}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > "/etc/systemd/system/${DNS_SET_SYNC_TIMER}" <<EOF
+[Unit]
+Description=DNS -> nftables set sync timer (every 5 min)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "${DNS_SET_SYNC_TIMER}" 2>/dev/null || true
+    info "DNS 定时同步已安装（每5分钟自动刷新）。"
+    echo "  查看状态: systemctl status ${DNS_SET_SYNC_TIMER}"
+    echo "  手动触发: systemctl start ${DNS_SET_SYNC_SERVICE}"
+    echo "  查看日志: journalctl -u ${DNS_SET_SYNC_SERVICE} -n 20"
+    log_action "安装 DNS 定时同步服务"
+}
+
+# ============== DNS 转发：新增 ==============
+do_add_dns_forward() {
+    echo ""
+    if ! command -v nft &>/dev/null; then
+        err "nftables 未安装，请先选择 [1] 安装。"
+        return
+    fi
+
+    mkdir -p "${CONF_DIR}" "${BACKUP_DIR}" 2>/dev/null || true
+    load_dns_rules
+
+    local domain
+    while true; do
+        read -rp "请输入目标域名（如 example.com，将自动解析 IP）: " domain
+        domain=$(echo "$domain" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        if [[ -n "$domain" && "$domain" =~ ^[a-z0-9][a-z0-9.-]*$ ]]; then
+            break
+        fi
+        err "域名格式无效，请重新输入。"
+    done
+
+    # 先试解析域名，验证可达性
+    local test_ips
+    test_ips=$(getent hosts "${domain}" 2>/dev/null | awk '{print $1}' | sort -u) || true
+    if [[ -n "$test_ips" ]]; then
+        info "域名解析成功: $(echo "$test_ips" | tr '\n' ' ')"
+    else
+        warn "域名 ${domain} 当前无法解析，规则仍会添加，定时同步将自动重试。"
+    fi
+
+    # 检查域名是否已配置
+    local rule d
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r d _ _ _ <<< "$rule"
+        if [[ "$d" == "$domain" ]]; then
+            err "域名 ${domain} 已存在 DNS 转发规则，请先删除后再添加。"
+            return
+        fi
+    done
+
+    local lport
+    while true; do
+        read -rp "本机监听端口（1-65535）: " lport
+        if validate_port "$lport"; then
+            break
+        fi
+        err "端口无效，请输入 1-65535。"
+    done
+
+    if ! check_port_conflict "$lport"; then
+        info "已取消。"
+        return
+    fi
+
+    # 目标远程端口（默认与监听端口相同）
+    local dport
+    while true; do
+        read -rp "目标远程端口（1-65535，默认 ${lport}）: " dport
+        dport="${dport:-$lport}"
+        if validate_port "$dport"; then
+            break
+        fi
+        err "端口无效，请输入 1-65535。"
+    done
+
+    # 自动生成 set_name
+    local set_name
+    set_name=$(echo "${domain}" | tr '.' '_' | tr '-' '_')
+    set_name="${set_name}_${lport}"
+    set_name="${set_name:0:31}"
+    read -rp "nft set 名称 [默认: ${set_name}]: " input_set_name
+    input_set_name=$(sanitize_rule_name "$input_set_name")
+    set_name="${input_set_name:-$set_name}"
+    if [[ ! "$set_name" =~ ^[a-zA-Z][a-zA-Z0-9_]*$ ]]; then
+        err "set 名称只能包含字母、数字、下划线，且必须以字母开头。"
+        return
+    fi
+
+    echo ""
+    echo "即将添加 DNS 动态转发规则:"
+    echo "  域名: ${domain}"
+    echo "  本机监听端口: ${lport}"
+    echo "  目标端口: ${dport}"
+    echo "  nft set: ${set_name}"
+    echo "  机制: 定时解析 ${domain} → IP 写入 set → 动态生成 DNAT 规则"
+    read -rp "确认添加？[Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        info "已取消。"
+        return
+    fi
+
+    backup_dns_conf
+    DNS_RULES+=("${domain}|${lport}|${dport}|${set_name}")
+
+    if ! write_dns_user_conf; then
+        return
+    fi
+
+    write_dnsmasq_conf || true
+    install_dnsmasq || true
+    firewall_open_dns_port "$lport"
+    write_dns_nft_conf || true
+    reload_dns_rules || true
+    sync_dns_to_nftset
+
+    if [[ ! -f "/etc/systemd/system/${DNS_SET_SYNC_TIMER}" ]]; then
+        read -rp "是否安装定时同步服务（每5分钟自动刷新 IP）？[Y/n]: " ans_timer
+        if [[ ! "$ans_timer" =~ ^[Nn]$ ]]; then
+            install_dns_sync_timer
+        fi
+    fi
+
+    info "DNS 动态转发规则添加完成: ${domain}:${lport} -> [自动解析]:${dport}"
+    log_action "新增DNS转发: ${domain}:${lport} -> :${dport} (set=${set_name})"
+}
+
+# ============== DNS 转发：列表 ==============
+do_list_dns_forward() {
+    echo ""
+    load_dns_rules
+
+    if [[ ${#DNS_RULES[@]} -eq 0 ]]; then
+        info "当前没有 DNS 动态转发规则，使用菜单 [8] → [1] 添加。"
+        return
+    fi
+
+    printf "\n\033[1m%-6s %-28s %-8s %-8s %s\033[0m\n" "序号" "域名" "监听端口" "目标端口" "当前解析 IP"
+    echo "──────────────────────────────────────────────────────────────────────────"
+
+    local idx=1 rule domain lport dport set_name
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r domain lport dport set_name <<< "$rule"
+        local ip_list
+        ip_list=$(nft list set ip port_forward_dns "${set_name}" 2>/dev/null \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//') || ip_list=""
+        local ip_count
+        ip_count=$(echo "$ip_list" | tr ',' '\n' | grep -c '.' 2>/dev/null) || ip_count=0
+        printf "%-6s %-28s %-8s %-8s" "$idx" "${domain}" "${lport}" "${dport}"
+        if [[ -n "$ip_list" ]]; then
+            printf " \033[32m[%s个]\033[0m %s" "$ip_count" "$ip_list"
+        else
+            printf " \033[33m[未解析]\033[0m"
+        fi
+        echo ""
+        ((idx++))
+    done
+    echo ""
+
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${DNS_SET_SYNC_TIMER}"; then
+        if systemctl is-active --quiet "${DNS_SET_SYNC_TIMER}" 2>/dev/null; then
+            info "定时同步: 已启用（每5分钟）"
+        else
+            warn "定时同步: 未运行"
+        fi
+    fi
+}
+
+# ============== DNS 转发：删除 ==============
+do_delete_dns_forward() {
+    echo ""
+    load_dns_rules
+
+    if [[ ${#DNS_RULES[@]} -eq 0 ]]; then
+        info "当前没有 DNS 动态转发规则。"
+        return
+    fi
+
+    printf "\n\033[1m%-6s %-28s %-8s %-8s %-25s\033[0m\n" "序号" "域名" "监听端口" "目标端口" "nft set"
+    echo "─────────────────────────────────────────────────────────────────────"
+
+    local idx=1 rule domain lport dport set_name
+    for rule in "${DNS_RULES[@]}"; do
+        IFS='|' read -r domain lport dport set_name <<< "$rule"
+        printf "%-6s %-28s %-8s %-8s %-25s\n" "$idx" "${domain}" "${lport}" "${dport}" "${set_name}"
+        ((idx++))
+    done
+    echo ""
+
+    local choice
+    read -rp "请输入要删除的序号 (0 取消): " choice
+
+    if [[ "$choice" == "0" ]] || [[ -z "$choice" ]]; then
+        info "已取消。"
+        return
+    fi
+
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#DNS_RULES[@]} )); then
+        err "无效的序号。"
+        return
+    fi
+
+    local target="${DNS_RULES[$((choice-1))]}"
+    IFS='|' read -r domain lport dport set_name <<< "$target"
+
+    echo "即将删除 DNS 动态转发规则:"
+    echo "  域名: ${domain}"
+    echo "  监听端口: ${lport}"
+    echo "  目标端口: ${dport}"
+    echo "  nft set: ${set_name}"
+    read -rp "确认删除？[Y/n]: " confirm
+    if [[ "$confirm" =~ ^[Nn]$ ]]; then
+        info "已取消。"
+        return
+    fi
+
+    backup_dns_conf
+    unset 'DNS_RULES[$((choice-1))]'
+    DNS_RULES=("${DNS_RULES[@]}")
+
+    write_dns_user_conf || { err "写入配置文件失败"; return 1; }
+    nft delete set ip port_forward_dns "${set_name}" 2>/dev/null || true
+    write_dnsmasq_conf || true
+    systemctl restart dnsmasq 2>/dev/null || true
+    write_dns_nft_conf || true
+    reload_dns_rules || true
+
+    if [[ ${#DNS_RULES[@]} -eq 0 ]]; then
+        systemctl stop "${DNS_SET_SYNC_TIMER}" 2>/dev/null || true
+        systemctl disable "${DNS_SET_SYNC_TIMER}" 2>/dev/null || true
+        info "已停止 DNS 定时同步服务（无剩余规则）。"
+    fi
+
+    info "DNS 动态转发规则已删除: ${domain} (${dport})"
+    log_action "删除DNS转发: ${domain}:${lport} -> :${dport}"
+}
+
+# ============== DNS 转发：手动同步 ==============
+do_sync_dns_now() {
+    echo ""
+    load_dns_rules
+    if [[ ${#DNS_RULES[@]} -eq 0 ]]; then
+        info "没有 DNS 转发规则。"
+        return
+    fi
+    sync_dns_to_nftset
+}
+
+# ============== DNS 转发子菜单 ==============
+do_dns_forward_menu() {
+    while true; do
+        echo ""
+        echo "========================================"
+        echo "     DNS 动态转发管理"
+        echo "     (dnsmasq + nft set)"
+        echo "========================================"
+        echo "  1) 新增 DNS 动态转发"
+        echo "  2) 查看 DNS 转发列表"
+        echo "  3) 删除 DNS 转发规则"
+        echo "  4) 手动同步 DNS → nft set"
+        echo "  5) 安装/重启 dnsmasq"
+        echo "  6) 返回主菜单"
+        echo "========================================"
+        read -rp "请选择操作 [1-6]: " dns_choice
+
+        case "$dns_choice" in
+            1) do_add_dns_forward ;;
+            2) do_list_dns_forward ;;
+            3) do_delete_dns_forward ;;
+            4) do_sync_dns_now ;;
+            5) install_dnsmasq ;;
+            6) break ;;
+            *) err "无效选择，请输入 1-6。" ;;
+        esac
+    done
+}
+
+# ============== Web 面板管理 ==============
+install_panel() {
+    local panel_port panel_user panel_pass
+    read -rp "面板端口 [默认: ${PANEL_PORT_DEFAULT}]: " panel_port
+    panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
+    if ! validate_port "$panel_port"; then
+        err "端口无效。"
+        return 1
+    fi
+
+    read -rp "面板用户名 [默认: ${PANEL_USER_DEFAULT}]: " panel_user
+    panel_user="${panel_user:-$PANEL_USER_DEFAULT}"
+    panel_user=$(sanitize_rule_name "$panel_user")
+    if [[ -z "$panel_user" ]]; then
+        err "用户名不能为空。"
+        return 1
+    fi
+
+    read -rsp "面板密码 [默认: ${PANEL_PASS_DEFAULT}]: " panel_pass
+    echo ""
+    panel_pass="${panel_pass:-$PANEL_PASS_DEFAULT}"
+    if [[ -z "$panel_pass" ]]; then
+        err "密码不能为空。"
+        return 1
+    fi
+
+    if ! command -v python3 &>/dev/null; then
+        err "未检测到 python3，请先安装 python3。"
+        return 1
+    fi
+
+    mkdir -p "${CONF_DIR}" "${BACKUP_DIR}" 2>/dev/null || true
+
+    cat > "${PANEL_BIN}" <<'PY'
+#!/usr/bin/env python3
+import base64
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote
+
+CONF_DIR = "/etc/nftables.d"
+CONF_FILE = "/etc/nftables.d/port-forward.conf"
+DNS_USER_CONF = "/etc/nftables.d/dns-forward.rules"
+DNS_CONF_FILE = "/etc/nftables.d/dns-forward.conf"
+BACKUP_DIR = "/etc/nftables.d/backups"
+TABLE_NAME = "port_forward"
+DNS_TABLE = "port_forward_dns"
+LOG_FILE = "/var/log/nft-forward.log"
+
+PANEL_USER = os.environ.get("PANEL_USER", "admin")
+PANEL_PASS = os.environ.get("PANEL_PASS", "admin123")
+PANEL_PORT = int(os.environ.get("PANEL_PORT", "4788"))
+
+def sh(cmd, check=False):
+    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg + "\n")
+    except OSError:
+        pass
+
+def valid_port(value):
+    try:
+        port = int(str(value))
+    except ValueError:
+        return False
+    return 1 <= port <= 65535 and str(value) == str(port)
+
+def valid_ip(value):
+    if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", value or ""):
+        return False
+    return all(0 <= int(part) <= 255 and (part == "0" or not part.startswith("0")) for part in value.split("."))
+
+def valid_domain(value):
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", (value or "").lower()))
+
+def safe_name(value, limit=60):
+    value = (value or "").replace("\r", " ").replace("\n", " ").replace("|", "-")
+    value = re.sub(r"[\x00-\x1f\x7f]", "", value).strip()
+    return value[:limit]
+
+def safe_set_name(value):
+    value = re.sub(r"[^A-Za-z0-9_]", "_", value or "")
+    if not re.match(r"^[A-Za-z]", value):
+        value = "set_" + value
+    return value[:31] or "set_default"
+
+def get_local_ip():
+    for cmd in (["ip", "route", "get", "1.1.1.1"], ["hostname", "-I"]):
+        try:
+            out = sh(cmd).stdout
+        except OSError:
+            continue
+        m = re.search(r"src\s+([0-9.]+)", out)
+        if m:
+            return m.group(1)
+        m = re.search(r"\b([0-9]{1,3}(?:\.[0-9]{1,3}){3})\b", out)
+        if m:
+            return m.group(1)
+    return "127.0.0.1"
+
+def ensure_dirs():
+    os.makedirs(CONF_DIR, exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+def backup(path):
+    if os.path.exists(path):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(path, os.path.join(BACKUP_DIR, os.path.basename(path) + "." + ts))
+
+def load_rules():
+    rules = []
+    if not os.path.exists(CONF_FILE):
+        return rules
+    prev = ""
+    with open(CONF_FILE, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            cm = re.match(r"\s*#\s*(.+)", line)
+            if cm:
+                prev = cm.group(1).strip()
+                continue
+            m = re.search(r"tcp\s+dport\s+(\d+)\s+dnat\s+to\s+([0-9.]+):(\d+)", line)
+            if m:
+                rules.append({"name": prev, "lport": m.group(1), "dip": m.group(2), "dport": m.group(3)})
+                prev = ""
+            elif line.strip():
+                prev = ""
+    return rules
+
+def write_rules(rules):
+    ensure_dirs()
+    local_ip = get_local_ip()
+    tmp = CONF_FILE + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("#!/usr/sbin/nft -f\n\n")
+        f.write("# --- 本机 IP（自动获取，用于 SNAT 回源）\n")
+        f.write("define LOCAL_IP = %s\n\n" % local_ip)
+        f.write("table ip %s {\n" % TABLE_NAME)
+        f.write("    chain prerouting {\n        type nat hook prerouting priority -100; policy accept;\n")
+        for r in rules:
+            name = safe_name(r.get("name")) or "转发: 本机:%s -> %s:%s" % (r["lport"], r["dip"], r["dport"])
+            f.write("\n        # %s\n" % name)
+            f.write("        tcp dport %s dnat to %s:%s\n" % (r["lport"], r["dip"], r["dport"]))
+            f.write("        udp dport %s dnat to %s:%s\n" % (r["lport"], r["dip"], r["dport"]))
+        f.write("    }\n\n")
+        f.write("    chain postrouting {\n        type nat hook postrouting priority 100; policy accept;\n")
+        for r in rules:
+            f.write("\n        # 回源: 发往 %s:%s 的已 DNAT 流量, SNAT 为本机 IP\n" % (r["dip"], r["dport"]))
+            f.write("        ip daddr %s tcp dport %s ct status dnat snat to $LOCAL_IP\n" % (r["dip"], r["dport"]))
+            f.write("        ip daddr %s udp dport %s ct status dnat snat to $LOCAL_IP\n" % (r["dip"], r["dport"]))
+        f.write("    }\n}\n")
+    os.replace(tmp, CONF_FILE)
+
+def load_dns_rules():
+    rules = []
+    if not os.path.exists(DNS_USER_CONF):
+        return rules
+    with open(DNS_USER_CONF, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) >= 4:
+                rules.append({"domain": parts[0], "lport": parts[1], "dport": parts[2], "set_name": parts[3]})
+    return rules
+
+def write_dns_user_rules(rules):
+    ensure_dirs()
+    tmp = DNS_USER_CONF + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rules:
+            f.write("%s|%s|%s|%s\n" % (r["domain"], r["lport"], r["dport"], r["set_name"]))
+    os.replace(tmp, DNS_USER_CONF)
+
+def resolve_domain(domain):
+    try:
+        out = sh(["getent", "hosts", domain]).stdout
+    except OSError:
+        return []
+    ips = []
+    for token in out.split():
+        if valid_ip(token) and token not in ips:
+            ips.append(token)
+    return ips
+
+def write_dns_nft(rules):
+    local_ip = get_local_ip()
+    tmp = DNS_CONF_FILE + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("#!/usr/sbin/nft -f\n")
+        f.write("# DNS 动态转发 - 面板生成\n")
+        f.write("table ip %s {\n" % DNS_TABLE)
+        for r in rules:
+            f.write("    set %s { type ipv4_addr; size 65536; flags interval; }\n" % r["set_name"])
+        f.write("\n    chain dns_prerouting { type nat hook prerouting priority -100; policy accept;\n")
+        for r in rules:
+            for ip in resolve_domain(r["domain"]):
+                f.write("        # %s:%s -> %s:%s\n" % (r["domain"], r["lport"], ip, r["dport"]))
+                f.write("        tcp dport %s dnat to %s:%s\n" % (r["lport"], ip, r["dport"]))
+                f.write("        udp dport %s dnat to %s:%s\n" % (r["lport"], ip, r["dport"]))
+        f.write("    }\n\n")
+        f.write("    chain dns_postrouting { type nat hook postrouting priority 100; policy accept;\n")
+        for r in rules:
+            for ip in resolve_domain(r["domain"]):
+                f.write("        ip daddr %s tcp dport %s ct status dnat snat to %s\n" % (ip, r["dport"], local_ip))
+                f.write("        ip daddr %s udp dport %s ct status dnat snat to %s\n" % (ip, r["dport"], local_ip))
+        f.write("    }\n}\n")
+    os.replace(tmp, DNS_CONF_FILE)
+
+def reload_nft():
+    results = []
+    if os.path.exists(CONF_FILE):
+        sh(["nft", "flush", "table", "ip", TABLE_NAME])
+        sh(["nft", "delete", "table", "ip", TABLE_NAME])
+        r = sh(["nft", "-f", CONF_FILE])
+        results.append(("port", r.returncode, r.stderr))
+    if os.path.exists(DNS_CONF_FILE):
+        sh(["nft", "flush", "table", "ip", DNS_TABLE])
+        sh(["nft", "delete", "table", "ip", DNS_TABLE])
+        r = sh(["nft", "-f", DNS_CONF_FILE])
+        results.append(("dns", r.returncode, r.stderr))
+    bad = [x for x in results if x[1] != 0]
+    if bad:
+        raise RuntimeError("; ".join("%s: %s" % (name, err.strip()) for name, _, err in bad))
+    return results
+
+def open_firewall_port(port, dip=None, dport=None):
+    if shutil.which("firewall-cmd") and sh(["systemctl", "is-active", "--quiet", "firewalld"]).returncode == 0:
+        sh(["firewall-cmd", "--add-port=%s/tcp" % port, "--permanent"])
+        sh(["firewall-cmd", "--add-port=%s/udp" % port, "--permanent"])
+        sh(["firewall-cmd", "--reload"])
+        return
+    if shutil.which("ufw") and "active" in sh(["ufw", "status"]).stdout:
+        sh(["ufw", "allow", "%s/tcp" % port])
+        sh(["ufw", "allow", "%s/udp" % port])
+        return
+    if shutil.which("iptables"):
+        for proto in ("tcp", "udp"):
+            if sh(["iptables", "-C", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"]).returncode != 0:
+                sh(["iptables", "-I", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"])
+            if dip and dport and sh(["iptables", "-C", "FORWARD", "-d", dip, "-p", proto, "--dport", str(dport), "-j", "ACCEPT"]).returncode != 0:
+                sh(["iptables", "-I", "FORWARD", "-d", dip, "-p", proto, "--dport", str(dport), "-j", "ACCEPT"])
+
+def close_firewall_port(port, dip=None, dport=None):
+    if shutil.which("firewall-cmd") and sh(["systemctl", "is-active", "--quiet", "firewalld"]).returncode == 0:
+        sh(["firewall-cmd", "--remove-port=%s/tcp" % port, "--permanent"])
+        sh(["firewall-cmd", "--remove-port=%s/udp" % port, "--permanent"])
+        sh(["firewall-cmd", "--reload"])
+        return
+    if shutil.which("ufw") and "active" in sh(["ufw", "status"]).stdout:
+        sh(["ufw", "delete", "allow", "%s/tcp" % port])
+        sh(["ufw", "delete", "allow", "%s/udp" % port])
+        return
+    if shutil.which("iptables"):
+        for proto in ("tcp", "udp"):
+            sh(["iptables", "-D", "INPUT", "-p", proto, "--dport", str(port), "-j", "ACCEPT"])
+            if dip and dport:
+                sh(["iptables", "-D", "FORWARD", "-d", dip, "-p", proto, "--dport", str(dport), "-j", "ACCEPT"])
+
+def status():
+    def active(unit):
+        return sh(["systemctl", "is-active", unit]).stdout.strip()
+    return {
+        "nftables": active("nftables"),
+        "panel": active("nft-forward-panel"),
+        "port_rules": load_rules(),
+        "dns_rules": load_dns_rules(),
+    }
+
+HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>nftables 转发面板</title>
+<style>
+body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f6f7f9;color:#172033}
+header{height:58px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;background:#172033;color:white}
+main{max-width:1180px;margin:24px auto;padding:0 18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+section{background:white;border:1px solid #e6e8ee;border-radius:8px;margin-bottom:18px;overflow:hidden}h2{font-size:16px;margin:0;padding:14px 16px;border-bottom:1px solid #e6e8ee}
+table{width:100%;border-collapse:collapse}th,td{padding:11px 12px;border-bottom:1px solid #eef0f4;text-align:left;font-size:14px}th{color:#667085;background:#fafbfc}
+.form{display:grid;grid-template-columns:1.2fr 1fr 1.3fr 1fr auto;gap:10px;padding:14px}.dns{grid-template-columns:1.5fr 1fr 1fr 1fr auto}
+input{height:36px;border:1px solid #cfd5df;border-radius:6px;padding:0 10px;font-size:14px}button{height:36px;border:0;border-radius:6px;padding:0 12px;background:#2563eb;color:white;cursor:pointer}
+button.secondary{background:#475467}button.danger{background:#dc2626}.pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
+.msg{white-space:pre-wrap;background:#101828;color:#d0d5dd;border-radius:8px;padding:12px;display:none;margin-bottom:16px;font-size:13px}.empty{padding:18px;color:#667085}
+@media(max-width:820px){.form,.dns{grid-template-columns:1fr}header{padding:0 14px}th{display:none}tr{display:block;padding:10px;border-bottom:1px solid #eef0f4}td{display:flex;justify-content:space-between;border:0;padding:5px 12px}td:before{content:attr(data-label);color:#667085}}
+</style></head><body><header><strong>nftables 转发面板</strong><span id="state">加载中</span></header><main>
+<div class="bar"><button onclick="load()">刷新</button><button class="secondary" onclick="reloadRules()">重载 nft</button></div><div id="msg" class="msg"></div>
+<section><h2>普通端口转发</h2><div class="form"><input id="name" placeholder="名称"><input id="lport" placeholder="本机端口"><input id="dip" placeholder="目标 IP"><input id="dport" placeholder="目标端口"><button onclick="addRule()">添加</button></div><div id="rules"></div></section>
+<section><h2>DNS 动态转发</h2><div class="form dns"><input id="domain" placeholder="域名 example.com"><input id="dlport" placeholder="本机端口"><input id="ddport" placeholder="目标端口"><input id="setname" placeholder="set 名称，可空"><button onclick="addDns()">添加</button></div><div id="dns"></div></section>
+</main><script>
+const $=id=>document.getElementById(id);function msg(t){$('msg').style.display='block';$('msg').textContent=t}
+async function api(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.statusText);return d}
+function table(rows,cols,delPrefix){if(!rows.length)return '<div class="empty">暂无规则</div>';return '<table><thead><tr>'+cols.map(c=>'<th>'+c[0]+'</th>').join('')+'<th>操作</th></tr></thead><tbody>'+rows.map((r,i)=>'<tr>'+cols.map(c=>'<td data-label="'+c[0]+'">'+(r[c[1]]||'')+'</td>').join('')+'<td data-label="操作"><button class="danger" onclick="del(\\''+delPrefix+'\\',\\''+(delPrefix==='rules'?r.lport:i)+'\\')">删除</button></td></tr>').join('')+'</tbody></table>'}
+async function load(){try{const d=await api('/api/state');$('state').innerHTML='nftables <span class="pill">'+d.nftables+'</span> 面板 <span class="pill">'+d.panel+'</span>';$('rules').innerHTML=table(d.port_rules,[['名称','name'],['本机端口','lport'],['目标 IP','dip'],['目标端口','dport']],'rules');$('dns').innerHTML=table(d.dns_rules,[['域名','domain'],['本机端口','lport'],['目标端口','dport'],['set','set_name']],'dns');}catch(e){msg(e.message)}}
+async function addRule(){try{await api('/api/rules',{method:'POST',body:JSON.stringify({name:$('name').value,lport:$('lport').value,dip:$('dip').value,dport:$('dport').value})});['name','lport','dip','dport'].forEach(id=>$(id).value='');msg('已添加并重载。');load()}catch(e){msg(e.message)}}
+async function addDns(){try{await api('/api/dns',{method:'POST',body:JSON.stringify({domain:$('domain').value,lport:$('dlport').value,dport:$('ddport').value,set_name:$('setname').value})});['domain','dlport','ddport','setname'].forEach(id=>$(id).value='');msg('已添加 DNS 规则并重载。');load()}catch(e){msg(e.message)}}
+async function del(kind,id){if(!confirm('确认删除？'))return;try{await api('/api/'+kind+'/'+encodeURIComponent(id),{method:'DELETE'});msg('已删除并重载。');load()}catch(e){msg(e.message)}}
+async function reloadRules(){try{await api('/api/reload',{method:'POST'});msg('重载完成。');load()}catch(e){msg(e.message)}}
+load()
+</script></body></html>"""
+
+class Handler(BaseHTTPRequestHandler):
+    def ok(self, data):
+        raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def fail(self, code, message):
+        raw = json.dumps({"error": str(message)}, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def auth_ok(self):
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return False
+        try:
+            user_pass = base64.b64decode(header.split(" ", 1)[1]).decode()
+        except Exception:
+            return False
+        return user_pass == PANEL_USER + ":" + PANEL_PASS
+
+    def require_auth(self):
+        if self.auth_ok():
+            return True
+        self.send_response(HTTPStatus.UNAUTHORIZED)
+        self.send_header("WWW-Authenticate", 'Basic realm="nft-forward-panel"')
+        self.end_headers()
+        return False
+
+    def body(self):
+        n = int(self.headers.get("Content-Length", "0") or "0")
+        return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+
+    def do_GET(self):
+        if not self.require_auth():
+            return
+        if self.path == "/":
+            raw = HTML.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        elif self.path == "/api/state":
+            self.ok(status())
+        else:
+            self.fail(HTTPStatus.NOT_FOUND, "not found")
+
+    def do_POST(self):
+        if not self.require_auth():
+            return
+        try:
+            if self.path == "/api/rules":
+                data = self.body()
+                name = safe_name(data.get("name"))
+                lport, dip, dport = str(data.get("lport", "")), str(data.get("dip", "")), str(data.get("dport", ""))
+                if not valid_port(lport) or not valid_ip(dip) or not valid_port(dport):
+                    raise ValueError("端口或 IP 格式无效")
+                rules = [r for r in load_rules() if r["lport"] != lport]
+                rules.append({"name": name, "lport": lport, "dip": dip, "dport": dport})
+                backup(CONF_FILE); write_rules(rules); reload_nft(); open_firewall_port(lport, dip, dport)
+                log("panel add port forward: %s -> %s:%s" % (lport, dip, dport))
+                self.ok({"status": "ok"})
+            elif self.path == "/api/dns":
+                data = self.body()
+                domain = str(data.get("domain", "")).strip().lower()
+                lport, dport = str(data.get("lport", "")), str(data.get("dport", ""))
+                if not valid_domain(domain) or not valid_port(lport) or not valid_port(dport):
+                    raise ValueError("域名或端口格式无效")
+                set_name = safe_set_name(data.get("set_name") or ("%s_%s" % (domain.replace(".", "_").replace("-", "_"), lport)))
+                rules = [r for r in load_dns_rules() if not (r["domain"] == domain and r["lport"] == lport)]
+                rules.append({"domain": domain, "lport": lport, "dport": dport, "set_name": set_name})
+                backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft(); open_firewall_port(lport)
+                log("panel add dns forward: %s:%s -> :%s" % (domain, lport, dport))
+                self.ok({"status": "ok"})
+            elif self.path == "/api/reload":
+                write_dns_nft(load_dns_rules())
+                reload_nft()
+                self.ok({"status": "ok"})
+            else:
+                self.fail(HTTPStatus.NOT_FOUND, "not found")
+        except Exception as e:
+            self.fail(HTTPStatus.BAD_REQUEST, e)
+
+    def do_DELETE(self):
+        if not self.require_auth():
+            return
+        try:
+            parts = self.path.strip("/").split("/")
+            if len(parts) == 3 and parts[0] == "api" and parts[1] == "rules":
+                lport = unquote(parts[2])
+                old_rules = load_rules()
+                removed = [r for r in old_rules if r["lport"] == lport]
+                rules = [r for r in old_rules if r["lport"] != lport]
+                backup(CONF_FILE); write_rules(rules); reload_nft()
+                for r in removed:
+                    close_firewall_port(r["lport"], r["dip"], r["dport"])
+                self.ok({"status": "ok"})
+            elif len(parts) == 3 and parts[0] == "api" and parts[1] == "dns":
+                idx = int(unquote(parts[2]))
+                rules = load_dns_rules()
+                if idx < 0 or idx >= len(rules):
+                    raise ValueError("序号无效")
+                del rules[idx]
+                backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft()
+                self.ok({"status": "ok"})
+            else:
+                self.fail(HTTPStatus.NOT_FOUND, "not found")
+        except Exception as e:
+            self.fail(HTTPStatus.BAD_REQUEST, e)
+
+    def log_message(self, fmt, *args):
+        return
+
+if __name__ == "__main__":
+    ensure_dirs()
+    httpd = ThreadingHTTPServer(("0.0.0.0", PANEL_PORT), Handler)
+    print("nft-forward-panel listening on 0.0.0.0:%d" % PANEL_PORT, flush=True)
+    httpd.serve_forever()
+PY
+
+    chmod +x "${PANEL_BIN}"
+
+    cat > "${PANEL_SERVICE_FILE}" <<EOF
+[Unit]
+Description=nftables Port Forward Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+Environment="PANEL_USER=${panel_user}"
+Environment="PANEL_PASS=${panel_pass}"
+Environment="PANEL_PORT=${panel_port}"
+ExecStart=${PANEL_BIN}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now "${PANEL_SERVICE}" >/dev/null 2>&1 || {
+        err "面板服务启动失败，请查看: journalctl -u ${PANEL_SERVICE} -n 50"
+        return 1
+    }
+
+    local ip
+    ip=$(curl -s4 ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+    ip="${ip:-服务器IP}"
+    info "面板已安装并启动。"
+    echo "访问地址: http://${ip}:${panel_port}"
+    echo "用户名: ${panel_user}"
+    echo "密码: ${panel_pass}"
+    log_action "安装 Web 面板: port=${panel_port}"
+}
+
+uninstall_panel() {
+    systemctl stop "${PANEL_SERVICE}" >/dev/null 2>&1 || true
+    systemctl disable "${PANEL_SERVICE}" >/dev/null 2>&1 || true
+    rm -f "${PANEL_SERVICE_FILE}" "${PANEL_BIN}"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    info "Web 面板已卸载。"
+    log_action "卸载 Web 面板"
+}
+
+update_panel_port() {
+    if [[ ! -f "${PANEL_SERVICE_FILE}" ]]; then
+        err "面板尚未安装。"
+        return 1
+    fi
+    local panel_port
+    read -rp "新的面板端口: " panel_port
+    if ! validate_port "$panel_port"; then
+        err "端口无效。"
+        return 1
+    fi
+    sed -i -E "s|Environment=\"PANEL_PORT=[0-9]+\"|Environment=\"PANEL_PORT=${panel_port}\"|" "${PANEL_SERVICE_FILE}"
+    systemctl daemon-reload
+    systemctl restart "${PANEL_SERVICE}" && info "面板端口已修改为 ${panel_port}。"
+}
+
+do_panel_menu() {
+    while true; do
+        echo ""
+        echo "========================================"
+        echo "        Web 面板管理"
+        echo "========================================"
+        echo "  1) 安装/更新 Web 面板"
+        echo "  2) 卸载 Web 面板"
+        echo "  3) 修改面板端口"
+        echo "  4) 查看面板状态"
+        echo "  5) 返回主菜单"
+        echo "========================================"
+        read -rp "请选择操作 [1-5]: " panel_choice
+
+        case "$panel_choice" in
+            1) install_panel ;;
+            2) uninstall_panel ;;
+            3) update_panel_port ;;
+            4) systemctl status "${PANEL_SERVICE}" --no-pager || true ;;
+            5) break ;;
+            *) err "无效选择，请输入 1-5。" ;;
+        esac
+    done
+}
+
+# ====================================================
+do_clear_all() {
+    echo ""
+    if ! command -v nft &>/dev/null; then
+        err "nftables 未安装，请先选择 [1] 安装。"
+        return
+    fi
+
+    load_rules
+
+    if [[ ${#RULES[@]} -eq 0 ]]; then
+        info "当前没有端口转发规则，无需清空。"
+        return
+    fi
+
+    warn "即将清空全部 ${#RULES[@]} 条转发规则！"
+    read -rp "确认清空？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        info "已取消。"
+        return
+    fi
+
+    backup_conf
+
+    local rule lport dip dport name
+    for rule in "${RULES[@]}"; do
+        IFS='|' read -r lport dip dport name <<< "$rule"
+        firewall_close_port "$lport" "$dip" "$dport" "force"
+    done
+
+    RULES=()
+    if ! write_conf_file; then
+        return
+    fi
+
+    if reload_rules; then
+        info "所有转发规则已清空。"
+        log_action "清空所有转发规则"
+    else
+        err "规则加载失败，请检查配置。"
+    fi
+}
+
+# ====================================================
+# 主菜单
+# ====================================================
+main_menu() {
+    while true; do
+        echo ""
+        echo "========================================"
+        echo "   nftables 端口转发管理工具 v1.6"
+        echo "========================================"
+        echo "  1) 安装 nftables"
+        echo "  2) 安装 iptables-persistent（持久化）"
+        echo "  3) 查看现有端口转发"
+        echo "  4) 新增端口转发"
+        echo "  5) 删除端口转发"
+        echo "  6) 一键清空所有转发"
+        echo "  7) 诊断/自检"
+        echo "  8) DNS 动态转发管理"
+        echo "  9) Web 面板管理"
+        echo "  10) 退出"
+        echo "========================================"
+        read -rp "请选择操作 [1-10]: " choice
+
+        case "$choice" in
+            1) do_install ;;
+            2) do_install_iptables_persistent ;;
+            3) do_list ;;
+            4) do_add ;;
+            5) do_delete ;;
+            6) do_clear_all ;;
+            7) do_diagnose ;;
+            8) do_dns_forward_menu ;;
+            9) do_panel_menu ;;
+            10)
+                info "再见！"
+                exit 0
+                ;;
+                *)
+                err "无效选择，请输入 1-10。"
+                ;;
+        esac
+    done
+}
+
+# ============== 入口 ==============
+check_root
+main_menu
