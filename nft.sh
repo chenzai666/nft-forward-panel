@@ -2419,6 +2419,8 @@ class Handler(BaseHTTPRequestHandler):
             raw = HTML.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -2521,7 +2523,8 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now "${PANEL_SERVICE}" >/dev/null 2>&1 || {
+    systemctl enable "${PANEL_SERVICE}" >/dev/null 2>&1 || true
+    systemctl restart "${PANEL_SERVICE}" >/dev/null 2>&1 || {
         err "面板服务启动失败，请查看: journalctl -u ${PANEL_SERVICE} -n 50"
         return 1
     }
