@@ -252,19 +252,30 @@ verify_panel_https() {
     local port="$2"
     local cert_ip="$3"
 
-    if ! command -v openssl &>/dev/null; then
-        warn "未安装 openssl，已跳过 HTTPS 握手检测。"
+    if ! command -v python3 &>/dev/null; then
+        warn "未安装 python3，已跳过 HTTPS 握手检测。"
         return 0
     fi
 
     local check_host="127.0.0.1"
     [[ "$host" == "127.0.0.1" || "$host" == "localhost" ]] && check_host="$host"
 
-    if timeout 8 openssl s_client -connect "${check_host}:${port}" -servername "${cert_ip:-$check_host}" </dev/null >/dev/null 2>&1; then
+    if python3 - "$check_host" "$port" "${cert_ip:-$check_host}" <<'PY' >/dev/null 2>&1
+import socket
+import ssl
+import sys
+
+host, port, server_name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+ctx = ssl._create_unverified_context()
+with socket.create_connection((host, port), timeout=8) as sock:
+    with ctx.wrap_socket(sock, server_hostname=server_name) as tls:
+        tls.version()
+PY
+    then
         return 0
     fi
 
-    err "HTTPS 握手检测失败。面板服务可能没有成功加载证书，或你访问的是错误端口。"
+    err "HTTPS 握手检测失败。面板服务可能没有成功加载证书，或该端口仍在提供 HTTP。"
     echo "请先查看服务日志: journalctl -u ${PANEL_SERVICE} -n 80 --no-pager"
     return 1
 }
