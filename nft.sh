@@ -78,6 +78,12 @@ validate_ip() {
     return 0
 }
 
+validate_listen_host() {
+    local host="$1"
+    [[ "$host" == "0.0.0.0" || "$host" == "127.0.0.1" || "$host" == "localhost" ]] && return 0
+    validate_ip "$host"
+}
+
 sanitize_rule_name() {
     local name="$1"
     name="${name//$'\r'/ }"
@@ -2094,6 +2100,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import time
 from http import HTTPStatus
@@ -2112,6 +2119,9 @@ LOG_FILE = "/var/log/nft-forward.log"
 PANEL_USER = os.environ.get("PANEL_USER", "admin")
 PANEL_PASS = os.environ.get("PANEL_PASS", "admin123")
 PANEL_PORT = int(os.environ.get("PANEL_PORT", "4788"))
+PANEL_HOST = os.environ.get("PANEL_HOST", "0.0.0.0")
+PANEL_CERT = os.environ.get("PANEL_CERT", "")
+PANEL_KEY = os.environ.get("PANEL_KEY", "")
 
 def sh(cmd, check=False):
     return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
@@ -2496,8 +2506,14 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     ensure_dirs()
-    httpd = ThreadingHTTPServer(("0.0.0.0", PANEL_PORT), Handler)
-    print("nft-forward-panel listening on 0.0.0.0:%d" % PANEL_PORT, flush=True)
+    httpd = ThreadingHTTPServer((PANEL_HOST, PANEL_PORT), Handler)
+    scheme = "http"
+    if PANEL_CERT and PANEL_KEY:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(PANEL_CERT, PANEL_KEY)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    print("nft-forward-panel listening on %s://%s:%d" % (scheme, PANEL_HOST, PANEL_PORT), flush=True)
     httpd.serve_forever()
 PY
 
@@ -2514,6 +2530,9 @@ User=root
 Environment="PANEL_USER=${panel_user}"
 Environment="PANEL_PASS=${panel_pass}"
 Environment="PANEL_PORT=${panel_port}"
+Environment="PANEL_HOST=0.0.0.0"
+Environment="PANEL_CERT="
+Environment="PANEL_KEY="
 ExecStart=${PANEL_BIN}
 Restart=always
 
@@ -2602,6 +2621,75 @@ update_panel_login() {
     fi
 }
 
+update_panel_tls() {
+    if [[ ! -f "${PANEL_SERVICE_FILE}" ]]; then
+        err "面板尚未安装。"
+        return 1
+    fi
+
+    local panel_host cert_path key_path
+    read -rp "监听 IP [默认 0.0.0.0，填 127.0.0.1 可仅本机访问]: " panel_host
+    panel_host="${panel_host:-0.0.0.0}"
+    if ! validate_listen_host "$panel_host"; then
+        err "监听 IP 无效，请输入 0.0.0.0、127.0.0.1、localhost 或 IPv4 地址。"
+        return 1
+    fi
+
+    echo "HTTPS 证书配置：证书和私钥都留空则使用 HTTP。"
+    read -rp "证书文件路径 cert/fullchain.pem: " cert_path
+    read -rp "私钥文件路径 key/privkey.pem: " key_path
+
+    if [[ -n "$cert_path" || -n "$key_path" ]]; then
+        if [[ -z "$cert_path" || -z "$key_path" ]]; then
+            err "启用 HTTPS 时证书和私钥路径都必须填写。"
+            return 1
+        fi
+        if [[ ! -f "$cert_path" ]]; then
+            err "证书文件不存在: ${cert_path}"
+            return 1
+        fi
+        if [[ ! -f "$key_path" ]]; then
+            err "私钥文件不存在: ${key_path}"
+            return 1
+        fi
+        if [[ "$cert_path" == *\"* || "$key_path" == *\"* ]]; then
+            err "证书路径不能包含双引号。"
+            return 1
+        fi
+    fi
+
+    if grep -q 'Environment="PANEL_HOST=' "${PANEL_SERVICE_FILE}"; then
+        sed -i -E "s|Environment=\"PANEL_HOST=.*\"|Environment=\"PANEL_HOST=${panel_host}\"|" "${PANEL_SERVICE_FILE}"
+    else
+        sed -i "/Environment=\"PANEL_PORT=/a Environment=\"PANEL_HOST=${panel_host}\"" "${PANEL_SERVICE_FILE}"
+    fi
+
+    if grep -q 'Environment="PANEL_CERT=' "${PANEL_SERVICE_FILE}"; then
+        sed -i -E "s|Environment=\"PANEL_CERT=.*\"|Environment=\"PANEL_CERT=${cert_path}\"|" "${PANEL_SERVICE_FILE}"
+    else
+        sed -i "/Environment=\"PANEL_HOST=/a Environment=\"PANEL_CERT=${cert_path}\"" "${PANEL_SERVICE_FILE}"
+    fi
+
+    if grep -q 'Environment="PANEL_KEY=' "${PANEL_SERVICE_FILE}"; then
+        sed -i -E "s|Environment=\"PANEL_KEY=.*\"|Environment=\"PANEL_KEY=${key_path}\"|" "${PANEL_SERVICE_FILE}"
+    else
+        sed -i "/Environment=\"PANEL_CERT=/a Environment=\"PANEL_KEY=${key_path}\"" "${PANEL_SERVICE_FILE}"
+    fi
+
+    systemctl daemon-reload
+    if systemctl restart "${PANEL_SERVICE}"; then
+        local scheme="http"
+        [[ -n "$cert_path" && -n "$key_path" ]] && scheme="https"
+        info "面板监听与证书配置已更新。"
+        echo "监听 IP: ${panel_host}"
+        echo "访问协议: ${scheme}"
+        log_action "修改 Web 面板监听/TLS: host=${panel_host} scheme=${scheme}"
+    else
+        err "面板重启失败，请查看: journalctl -u ${PANEL_SERVICE} -n 50"
+        return 1
+    fi
+}
+
 do_panel_menu() {
     while true; do
         echo ""
@@ -2612,19 +2700,21 @@ do_panel_menu() {
         echo "  2) 卸载 Web 面板"
         echo "  3) 修改面板端口"
         echo "  4) 修改登录信息"
-        echo "  5) 查看面板状态"
-        echo "  6) 返回主菜单"
+        echo "  5) 配置监听 IP / HTTPS 证书"
+        echo "  6) 查看面板状态"
+        echo "  7) 返回主菜单"
         echo "========================================"
-        read -rp "请选择操作 [1-6]: " panel_choice
+        read -rp "请选择操作 [1-7]: " panel_choice
 
         case "$panel_choice" in
             1) install_panel ;;
             2) uninstall_panel ;;
             3) update_panel_port ;;
             4) update_panel_login ;;
-            5) systemctl status "${PANEL_SERVICE}" --no-pager || true ;;
-            6) break ;;
-            *) err "无效选择，请输入 1-6。" ;;
+            5) update_panel_tls ;;
+            6) systemctl status "${PANEL_SERVICE}" --no-pager || true ;;
+            7) break ;;
+            *) err "无效选择，请输入 1-7。" ;;
         esac
     done
 }
