@@ -2398,6 +2398,18 @@ def safe_set_name(value):
         value = "set_" + value
     return value[:31] or "set_default"
 
+def unique_set_name(base, rules, skip_index=None):
+    base = safe_set_name(base)
+    used = {r.get("set_name") for i, r in enumerate(rules) if i != skip_index}
+    if base not in used:
+        return base
+    for i in range(2, 1000):
+        suffix = "_%d" % i
+        candidate = (base[:31 - len(suffix)] + suffix) if len(base) + len(suffix) > 31 else base + suffix
+        if candidate not in used:
+            return candidate
+    raise ValueError("nft set 名称冲突过多")
+
 def get_local_ip():
     for cmd in (["ip", "route", "get", "1.1.1.1"], ["hostname", "-I"]):
         try:
@@ -2516,6 +2528,12 @@ def resolve_domain(domain):
 
 def write_dns_nft(rules):
     ensure_persistence()
+    if not rules:
+        try:
+            os.remove(DNS_CONF_FILE)
+        except FileNotFoundError:
+            pass
+        return
     local_ip = get_local_ip()
     tmp = DNS_CONF_FILE + ".tmp.%d" % os.getpid()
     with open(tmp, "w", encoding="utf-8") as f:
@@ -2546,11 +2564,17 @@ def reload_nft():
         sh(["nft", "delete", "table", "ip", TABLE_NAME])
         r = sh(["nft", "-f", CONF_FILE])
         results.append(("port", r.returncode, r.stderr))
+    else:
+        sh(["nft", "flush", "table", "ip", TABLE_NAME])
+        sh(["nft", "delete", "table", "ip", TABLE_NAME])
     if os.path.exists(DNS_CONF_FILE):
         sh(["nft", "flush", "table", "ip", DNS_TABLE])
         sh(["nft", "delete", "table", "ip", DNS_TABLE])
         r = sh(["nft", "-f", DNS_CONF_FILE])
         results.append(("dns", r.returncode, r.stderr))
+    else:
+        sh(["nft", "flush", "table", "ip", DNS_TABLE])
+        sh(["nft", "delete", "table", "ip", DNS_TABLE])
     bad = [x for x in results if x[1] != 0]
     if bad:
         raise RuntimeError("; ".join("%s: %s" % (name, err.strip()) for name, _, err in bad))
@@ -2750,8 +2774,8 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 dns_rules = load_dns_rules()
-                set_name = safe_set_name("%s_%s" % (target.replace(".", "_").replace("-", "_"), lport))
                 dns_rules = [r for r in dns_rules if not (r["domain"] == target and r["lport"] == lport)]
+                set_name = unique_set_name("%s_%s" % (target.replace(".", "_").replace("-", "_"), lport), dns_rules)
                 dns_rules.append({"domain": target, "lport": lport, "dport": dport, "set_name": set_name})
                 backup(CONF_FILE); backup(DNS_USER_CONF)
                 write_rules(port_rules); write_dns_user_rules(dns_rules); write_dns_nft(dns_rules); reload_nft(); open_firewall_port(lport)
@@ -2766,9 +2790,10 @@ class Handler(BaseHTTPRequestHandler):
                 lport, dport = str(data.get("lport", "")), str(data.get("dport", ""))
                 if not valid_domain(domain) or not valid_port(lport) or not valid_port(dport):
                     raise ValueError("域名或端口格式无效")
-                set_name = safe_set_name(data.get("set_name") or ("%s_%s" % (domain.replace(".", "_").replace("-", "_"), lport)))
                 rules = load_dns_rules()
                 old_index = data.get("old_index")
+                skip_index = int(old_index) if old_index not in (None, "") else None
+                set_name = unique_set_name(data.get("set_name") or ("%s_%s" % (domain.replace(".", "_").replace("-", "_"), lport)), rules, skip_index)
                 old_rule = None
                 if old_index not in (None, ""):
                     old_index = int(old_index)
@@ -2813,8 +2838,10 @@ class Handler(BaseHTTPRequestHandler):
                 rules = load_dns_rules()
                 if idx < 0 or idx >= len(rules):
                     raise ValueError("序号无效")
-                del rules[idx]
+                old_rule = rules.pop(idx)
                 backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft()
+                if not any(r.get("lport") == old_rule.get("lport") for r in rules):
+                    close_firewall_port(old_rule["lport"])
                 self.ok({"status": "ok"})
             else:
                 self.fail(HTTPStatus.NOT_FOUND, "not found")
