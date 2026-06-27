@@ -84,6 +84,142 @@ validate_listen_host() {
     validate_ip "$host"
 }
 
+validate_public_ipv4() {
+    local ip="$1"
+    validate_ip "$ip" || return 1
+
+    local IFS='.'
+    local a b c d
+    read -r a b c d <<< "$ip"
+
+    # IP 证书只能给公网 IP 申请，内网、回环、链路本地、组播/保留地址都拒绝。
+    (( a == 0 || a == 10 || a == 127 || a >= 224 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    (( a == 198 && (b == 18 || b == 19) )) && return 1
+
+    return 0
+}
+
+find_acme_sh() {
+    if command -v acme.sh &>/dev/null; then
+        command -v acme.sh
+        return 0
+    fi
+    if [[ -x "${HOME}/.acme.sh/acme.sh" ]]; then
+        echo "${HOME}/.acme.sh/acme.sh"
+        return 0
+    fi
+    if [[ -x "/root/.acme.sh/acme.sh" ]]; then
+        echo "/root/.acme.sh/acme.sh"
+        return 0
+    fi
+    return 1
+}
+
+install_acme_deps() {
+    local pkg_mgr
+    pkg_mgr=$(detect_pkg_manager)
+
+    case "$pkg_mgr" in
+        apt)
+            apt-get update -y >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y curl socat openssl ca-certificates >/dev/null 2>&1
+            ;;
+        dnf)
+            dnf install -y curl socat openssl ca-certificates >/dev/null 2>&1
+            ;;
+        yum)
+            yum install -y curl socat openssl ca-certificates >/dev/null 2>&1
+            ;;
+        pacman)
+            pacman -Sy --noconfirm curl socat openssl ca-certificates >/dev/null 2>&1
+            ;;
+        *)
+            command -v curl &>/dev/null && command -v socat &>/dev/null
+            ;;
+    esac
+}
+
+ensure_acme_sh() {
+    local acme_bin acme_email install_cmd
+    acme_bin=$(find_acme_sh 2>/dev/null || true)
+    if [[ -n "$acme_bin" ]]; then
+        echo "$acme_bin"
+        return 0
+    fi
+
+    warn "未检测到 acme.sh，将自动安装用于申请真实 IP 证书。" >&2
+    install_acme_deps || true
+    if ! command -v curl &>/dev/null; then
+        err "未安装 curl，无法安装 acme.sh。" >&2
+        return 1
+    fi
+
+    read -rp "Let's Encrypt 账号邮箱 [可留空]: " acme_email
+    if [[ -n "$acme_email" ]]; then
+        curl -fsSL https://get.acme.sh | sh -s "email=${acme_email}" >/dev/null || return 1
+    else
+        curl -fsSL https://get.acme.sh | sh >/dev/null || return 1
+    fi
+
+    acme_bin=$(find_acme_sh 2>/dev/null || true)
+    if [[ -z "$acme_bin" ]]; then
+        err "acme.sh 安装后仍未找到可执行文件。" >&2
+        return 1
+    fi
+
+    echo "$acme_bin"
+}
+
+issue_ip_certificate() {
+    local cert_ip="$1"
+    local cert_path="$2"
+    local key_path="$3"
+    local acme_bin cert_dir key_dir reload_cmd
+
+    acme_bin=$(ensure_acme_sh) || {
+        err "acme.sh 准备失败，无法申请 IP 证书。"
+        return 1
+    }
+
+    cert_dir=$(dirname "$cert_path")
+    key_dir=$(dirname "$key_path")
+    reload_cmd="systemctl restart ${PANEL_SERVICE}"
+
+    warn "开始申请 Let's Encrypt 真实 IP 证书。"
+    warn "要求：${cert_ip} 必须是本机公网 IP，并且公网 80 端口能访问到这台服务器。"
+
+    "$acme_bin" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    "$acme_bin" --upgrade --auto-upgrade >/dev/null 2>&1 || true
+
+    if ! "$acme_bin" --issue --server letsencrypt --standalone -d "$cert_ip" \
+        --certificate-profile shortlived --days 3 --force; then
+        err "IP 证书申请失败。请确认公网 IP 正确、80 端口未被占用且防火墙/安全组已放行。"
+        return 1
+    fi
+
+    mkdir -p "$cert_dir" "$key_dir" || {
+        err "无法创建证书安装目录。"
+        return 1
+    }
+
+    if ! "$acme_bin" --install-cert -d "$cert_ip" \
+        --key-file "$key_path" \
+        --fullchain-file "$cert_path" \
+        --reloadcmd "$reload_cmd"; then
+        err "证书申请成功，但安装到指定路径失败。"
+        return 1
+    fi
+
+    chmod 600 "$key_path" 2>/dev/null || true
+    info "IP 证书已申请并安装。"
+    info "证书: ${cert_path}"
+    info "私钥: ${key_path}"
+}
+
 sanitize_rule_name() {
     local name="$1"
     name="${name//$'\r'/ }"
@@ -2627,7 +2763,7 @@ update_panel_tls() {
         return 1
     fi
 
-    local panel_host cert_path key_path
+    local panel_host cert_path key_path cert_ip
     read -rp "监听 IP [默认 0.0.0.0，填 127.0.0.1 可仅本机访问]: " panel_host
     panel_host="${panel_host:-0.0.0.0}"
     if ! validate_listen_host "$panel_host"; then
@@ -2636,6 +2772,8 @@ update_panel_tls() {
     fi
 
     echo "HTTPS 证书配置：证书和私钥都留空则使用 HTTP。"
+    echo "如填写的证书/私钥不存在，脚本会申请 Let's Encrypt 真实 IP 证书，不会生成自签证书。"
+    echo "申请 IP 证书要求：公网 IP、80 端口可从公网访问、不能使用内网/回环 IP。"
     read -rp "证书文件路径 cert/fullchain.pem: " cert_path
     read -rp "私钥文件路径 key/privkey.pem: " key_path
 
@@ -2653,23 +2791,23 @@ update_panel_tls() {
             return 1
         }
         if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
-            if ! command -v openssl &>/dev/null; then
-                err "证书文件不存在且未安装 openssl，无法自动生成自签名证书。"
+            echo "证书或私钥不存在，将申请真实 IP 证书。"
+            if validate_public_ipv4 "$panel_host"; then
+                read -rp "证书 IP [默认 ${panel_host}]: " cert_ip
+                cert_ip="${cert_ip:-$panel_host}"
+            else
+                read -rp "证书 IP [必须填写服务器公网 IPv4，不能填 ${panel_host}]: " cert_ip
+            fi
+
+            if ! validate_public_ipv4 "$cert_ip"; then
+                err "证书 IP 无效。IP 证书只能申请公网 IPv4，不能使用 0.0.0.0、127.0.0.1 或内网 IP。"
                 return 1
             fi
-            warn "证书或私钥不存在，将自动生成自签名证书。"
-            local cert_cn="${panel_host}"
-            [[ "$cert_cn" == "0.0.0.0" ]] && cert_cn="nft-forward-panel"
-            openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-                -keyout "$key_path" \
-                -out "$cert_path" \
-                -subj "/CN=${cert_cn}" >/dev/null 2>&1 || {
-                err "自签名证书生成失败。"
+
+            issue_ip_certificate "$cert_ip" "$cert_path" "$key_path" || {
+                err "HTTPS 配置未更新，仍保留当前面板配置。"
                 return 1
             }
-            chmod 600 "$key_path" 2>/dev/null || true
-            info "已生成自签名证书: ${cert_path}"
-            info "已生成私钥: ${key_path}"
         fi
     fi
 
