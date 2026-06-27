@@ -2674,7 +2674,7 @@ function stateClass(v){return v==='active'?'ok':(v==='inactive'||!v?'warn':'bad'
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function switchTab(tab){currentTab=tab;document.querySelectorAll('#ruleTabs .tab').forEach((b,i)=>b.classList.toggle('active',(tab==='port'?i===0:i===1)));$('portPane').classList.toggle('active',tab==='port');$('dnsPane').classList.toggle('active',tab==='dns');$('totalBadge').textContent=(tab==='port'?$('portCount').textContent:$('dnsCount').textContent)+' \u6761'}
 function switchForm(tab){document.querySelectorAll('#formTabs .tab').forEach((b,i)=>b.classList.toggle('active',(tab==='port'?i===0:i===1)));$('portForm').style.display=tab==='port'?'grid':'none';$('dnsForm').style.display=tab==='dns'?'grid':'none'}
-function table(rows,kind){if(!rows.length)return '<div class="empty"><strong>\u6682\u65e0\u89c4\u5219</strong><span>\u6dfb\u52a0\u540e\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\u3002</span></div>';const isPort=kind==='rules';const heads=isPort?['\u540d\u79f0','\u5165\u53e3','\u76ee\u6807','\u7c7b\u578b','\u8fde\u901a\u6027','\u64cd\u4f5c']:['\u57df\u540d','\u5165\u53e3','\u76ee\u6807\u7aef\u53e3','set','\u8fde\u901a\u6027','\u64cd\u4f5c'];return '<table><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows.map((r,i)=>{const id=isPort?r.lport:i;const host=isPort?r.dip:r.domain;const port=isPort?r.dport:r.dport;const target=isPort?esc(r.dip)+':'+esc(r.dport):esc(r.dport);const first=isPort?esc(r.name||'\u672a\u547d\u540d'):esc(r.domain);const set=isPort?'<span class="badge green">tcp+udp</span>':'<span class="badge amber">'+esc(r.set_name)+'</span>';const test='<button class="ghost small testbtn" data-host="'+esc(host)+'" data-port="'+esc(port)+'">\u6d4b\u8bd5</button> <span class="testout" data-test="'+esc(host)+':'+esc(port)+'"></span>';const editData=isPort?' data-kind="rules" data-id="'+esc(id)+'" data-name="'+esc(r.name||'')+'" data-lport="'+esc(r.lport)+'" data-dip="'+esc(r.dip)+'" data-dport="'+esc(r.dport)+'"':' data-kind="dns" data-id="'+esc(id)+'" data-domain="'+esc(r.domain)+'" data-lport="'+esc(r.lport)+'" data-dport="'+esc(r.dport)+'" data-set="'+esc(r.set_name)+'"';const ops='<button class="ghost small editbtn"'+editData+'>\u7f16\u8f91</button> <button class="danger small delbtn" data-kind="'+kind+'" data-id="'+esc(id)+'">\u5220\u9664</button>';return '<tr><td data-label="'+heads[0]+'" class="namecell">'+first+'</td><td data-label="'+heads[1]+'"><span class="badge blue">'+esc(r.lport)+'</span></td><td data-label="'+heads[2]+'" class="target">'+target+'</td><td data-label="'+heads[3]+'">'+set+'</td><td data-label="'+heads[4]+'">'+test+'</td><td data-label="\u64cd\u4f5c">'+ops+'</td></tr>'}).join('')+'</tbody></table>'}
+function table(rows,kind){if(!rows.length)return '<div class="empty"><strong>\u6682\u65e0\u89c4\u5219</strong><span>\u6dfb\u52a0\u540e\u4f1a\u663e\u793a\u5728\u8fd9\u91cc\u3002</span></div>';const isPort=kind==='rules';const heads=isPort?['\u540d\u79f0','\u5165\u53e3','\u76ee\u6807','\u7c7b\u578b','\u8fde\u901a\u6027','\u64cd\u4f5c']:['\u57df\u540d','\u5165\u53e3','\u76ee\u6807\u7aef\u53e3','set','\u8fde\u901a\u6027','\u64cd\u4f5c'];return '<table><thead><tr>'+heads.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+rows.map((r,i)=>{const id=isPort?r.lport:i;const delId=isPort?id:(r.domain+'|'+r.lport);const host=isPort?r.dip:r.domain;const port=isPort?r.dport:r.dport;const target=isPort?esc(r.dip)+':'+esc(r.dport):esc(r.dport);const first=isPort?esc(r.name||'\u672a\u547d\u540d'):esc(r.domain);const set=isPort?'<span class="badge green">tcp+udp</span>':'<span class="badge amber">'+esc(r.set_name)+'</span>';const test='<button class="ghost small testbtn" data-host="'+esc(host)+'" data-port="'+esc(port)+'">\u6d4b\u8bd5</button> <span class="testout" data-test="'+esc(host)+':'+esc(port)+'"></span>';const editData=isPort?' data-kind="rules" data-id="'+esc(id)+'" data-name="'+esc(r.name||'')+'" data-lport="'+esc(r.lport)+'" data-dip="'+esc(r.dip)+'" data-dport="'+esc(r.dport)+'"':' data-kind="dns" data-id="'+esc(id)+'" data-domain="'+esc(r.domain)+'" data-lport="'+esc(r.lport)+'" data-dport="'+esc(r.dport)+'" data-set="'+esc(r.set_name)+'"';const ops='<button class="ghost small editbtn"'+editData+'>\u7f16\u8f91</button> <button class="danger small delbtn" data-kind="'+kind+'" data-id="'+esc(delId)+'">\u5220\u9664</button>';return '<tr><td data-label="'+heads[0]+'" class="namecell">'+first+'</td><td data-label="'+heads[1]+'"><span class="badge blue">'+esc(r.lport)+'</span></td><td data-label="'+heads[2]+'" class="target">'+target+'</td><td data-label="'+heads[3]+'">'+set+'</td><td data-label="'+heads[4]+'">'+test+'</td><td data-label="\u64cd\u4f5c">'+ops+'</td></tr>'}).join('')+'</tbody></table>'}
 async function load(){try{const d=await api('/api/state');$('nftState').textContent=d.nftables||'-';$('panelState').textContent=d.panel||'-';$('nftState').className='value '+stateClass(d.nftables);$('panelState').className='value '+stateClass(d.panel);$('portCount').textContent=d.port_rules.length;$('dnsCount').textContent=d.dns_rules.length;$('rules').innerHTML=table(d.port_rules,'rules');$('dns').innerHTML=table(d.dns_rules,'dns');$('last').textContent='\u6700\u540e\u5237\u65b0 '+new Date().toLocaleTimeString();switchTab(currentTab)}catch(e){$('last').textContent='\u52a0\u8f7d\u5931\u8d25';showMsg(e.message,'error')}}
 function clearPortEdit(){editPort=null;['name','lport','dip','dport'].forEach(id=>$(id).value='');$('addRuleBtn').textContent='\u6dfb\u52a0\u8f6c\u53d1'}
 function clearDnsEdit(){editDns=null;['domain','dlport','ddport','setname'].forEach(id=>$(id).value='');$('addDnsBtn').textContent='\u6dfb\u52a0 DNS \u8f6c\u53d1'}
@@ -2834,11 +2834,27 @@ class Handler(BaseHTTPRequestHandler):
                     close_firewall_port(r["lport"], r["dip"], r["dport"])
                 self.ok({"status": "ok"})
             elif len(parts) == 3 and parts[0] == "api" and parts[1] == "dns":
-                idx = int(unquote(parts[2]))
+                key = unquote(parts[2])
                 rules = load_dns_rules()
-                if idx < 0 or idx >= len(rules):
-                    raise ValueError("序号无效")
-                old_rule = rules.pop(idx)
+                old_rule = None
+                if key.isdigit():
+                    idx = int(key)
+                    if idx < 0 or idx >= len(rules):
+                        raise ValueError("????")
+                    old_rule = rules.pop(idx)
+                else:
+                    if "|" not in key:
+                        raise ValueError("??????")
+                    domain, lport = key.split("|", 1)
+                    kept = []
+                    for r in rules:
+                        if old_rule is None and r.get("domain") == domain and r.get("lport") == lport:
+                            old_rule = r
+                        else:
+                            kept.append(r)
+                    if old_rule is None:
+                        raise ValueError("?????")
+                    rules = kept
                 backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft()
                 if not any(r.get("lport") == old_rule.get("lport") for r in rules):
                     close_firewall_port(old_rule["lport"])
