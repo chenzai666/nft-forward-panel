@@ -2254,32 +2254,58 @@ do_dns_forward_menu() {
 
 # ============== Web 面板管理 ==============
 install_panel() {
-    local panel_port panel_user panel_pass
-    read -rp "面板端口 [默认: ${PANEL_PORT_DEFAULT}]: " panel_port
-    panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
-    if ! validate_port "$panel_port"; then
-        err "端口无效。"
-        return 1
-    fi
+    local panel_port panel_user panel_pass panel_host panel_cert panel_key existing_panel
+    existing_panel=0
+    [[ -f "${PANEL_SERVICE_FILE}" ]] && existing_panel=1
 
-    read -rp "面板用户名 [默认: ${PANEL_USER_DEFAULT}]: " panel_user
-    panel_user="${panel_user:-$PANEL_USER_DEFAULT}"
-    panel_user=$(sanitize_rule_name "$panel_user")
-    if [[ -z "$panel_user" ]]; then
-        err "用户名不能为空。"
-        return 1
-    fi
+    if (( existing_panel )); then
+        panel_port=$(get_panel_env "PANEL_PORT")
+        panel_user=$(get_panel_env "PANEL_USER")
+        panel_pass=$(get_panel_env "PANEL_PASS")
+        panel_host=$(get_panel_env "PANEL_HOST")
+        panel_cert=$(get_panel_env "PANEL_CERT")
+        panel_key=$(get_panel_env "PANEL_KEY")
 
-    read -rsp "面板密码 [默认: ${PANEL_PASS_DEFAULT}]: " panel_pass
-    echo ""
-    panel_pass="${panel_pass:-$PANEL_PASS_DEFAULT}"
-    if [[ -z "$panel_pass" ]]; then
-        err "密码不能为空。"
-        return 1
-    fi
-    if [[ "$panel_pass" == *\"* || "$panel_pass" == *\\* || "$panel_pass" == *$'\n'* || "$panel_pass" == *$'\r'* ]]; then
-        err "密码不能包含双引号、反斜杠或换行。"
-        return 1
+        panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
+        panel_user="${panel_user:-$PANEL_USER_DEFAULT}"
+        panel_pass="${panel_pass:-$PANEL_PASS_DEFAULT}"
+        panel_host="${panel_host:-0.0.0.0}"
+        panel_cert="${panel_cert:-}"
+        panel_key="${panel_key:-}"
+        info "检测到已安装 Web 面板，本次仅更新面板程序并保留现有配置。"
+        echo "端口: ${panel_port}"
+        echo "用户名: ${panel_user}"
+        echo "监听 IP: ${panel_host}"
+    else
+        read -rp "面板端口 [默认: ${PANEL_PORT_DEFAULT}]: " panel_port
+        panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
+        if ! validate_port "$panel_port"; then
+            err "端口无效。"
+            return 1
+        fi
+
+        read -rp "面板用户名 [默认: ${PANEL_USER_DEFAULT}]: " panel_user
+        panel_user="${panel_user:-$PANEL_USER_DEFAULT}"
+        panel_user=$(sanitize_rule_name "$panel_user")
+        if [[ -z "$panel_user" ]]; then
+            err "用户名不能为空。"
+            return 1
+        fi
+
+        read -rsp "面板密码 [默认: ${PANEL_PASS_DEFAULT}]: " panel_pass
+        echo ""
+        panel_pass="${panel_pass:-$PANEL_PASS_DEFAULT}"
+        if [[ -z "$panel_pass" ]]; then
+            err "密码不能为空。"
+            return 1
+        fi
+        if [[ "$panel_pass" == *\"* || "$panel_pass" == *\\* || "$panel_pass" == *$'\n'* || "$panel_pass" == *$'\r'* ]]; then
+            err "密码不能包含双引号、反斜杠或换行。"
+            return 1
+        fi
+        panel_host="0.0.0.0"
+        panel_cert=""
+        panel_key=""
     fi
 
     if ! command -v python3 &>/dev/null; then
@@ -2801,9 +2827,9 @@ User=root
 Environment="PANEL_USER=${panel_user}"
 Environment="PANEL_PASS=${panel_pass}"
 Environment="PANEL_PORT=${panel_port}"
-Environment="PANEL_HOST=0.0.0.0"
-Environment="PANEL_CERT="
-Environment="PANEL_KEY="
+Environment="PANEL_HOST=${panel_host}"
+Environment="PANEL_CERT=${panel_cert}"
+Environment="PANEL_KEY=${panel_key}"
 ExecStart=${PANEL_BIN}
 Restart=always
 
@@ -2821,11 +2847,17 @@ EOF
     local ip
     ip=$(curl -s4 ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
     ip="${ip:-服务器IP}"
-    info "面板已安装并启动。"
-    echo "访问地址: http://${ip}:${panel_port}"
+    local scheme="http"
+    [[ -n "$panel_cert" && -n "$panel_key" ]] && scheme="https"
+    if (( existing_panel )); then
+        info "面板已更新并重启，原有配置已保留。"
+    else
+        info "面板已安装并启动。"
+    fi
+    echo "访问地址: ${scheme}://${ip}:${panel_port}"
     echo "用户名: ${panel_user}"
-    echo "密码: ${panel_pass}"
-    log_action "安装 Web 面板: port=${panel_port}"
+    (( existing_panel )) || echo "密码: ${panel_pass}"
+    log_action "安装/更新 Web 面板: port=${panel_port}"
 }
 
 uninstall_panel() {
@@ -2999,7 +3031,7 @@ do_panel_menu() {
         echo "========================================"
         echo "        Web 面板管理"
         echo "========================================"
-        echo "  1) 安装/更新 Web 面板"
+        echo "  1) 安装/更新 Web 面板（更新时保留现有配置）"
         echo "  2) 卸载 Web 面板"
         echo "  3) 修改面板端口"
         echo "  4) 修改登录信息"
