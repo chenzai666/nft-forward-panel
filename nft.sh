@@ -2074,6 +2074,10 @@ install_panel() {
         err "密码不能为空。"
         return 1
     fi
+    if [[ "$panel_pass" == *\"* || "$panel_pass" == *\\* || "$panel_pass" == *$'\n'* || "$panel_pass" == *$'\r'* ]]; then
+        err "密码不能包含双引号、反斜杠或换行。"
+        return 1
+    fi
 
     if ! command -v python3 &>/dev/null; then
         err "未检测到 python3，请先安装 python3。"
@@ -2556,6 +2560,45 @@ update_panel_port() {
     systemctl restart "${PANEL_SERVICE}" && info "面板端口已修改为 ${panel_port}。"
 }
 
+update_panel_login() {
+    if [[ ! -f "${PANEL_SERVICE_FILE}" ]]; then
+        err "面板尚未安装。"
+        return 1
+    fi
+
+    local panel_user panel_pass
+    read -rp "新的面板用户名: " panel_user
+    panel_user=$(sanitize_rule_name "$panel_user")
+    if [[ -z "$panel_user" ]]; then
+        err "用户名不能为空。"
+        return 1
+    fi
+
+    read -rsp "新的面板密码: " panel_pass
+    echo ""
+    if [[ -z "$panel_pass" ]]; then
+        err "密码不能为空。"
+        return 1
+    fi
+    if [[ "$panel_pass" == *\"* || "$panel_pass" == *\\* || "$panel_pass" == *$'\n'* || "$panel_pass" == *$'\r'* ]]; then
+        err "密码不能包含双引号、反斜杠或换行。"
+        return 1
+    fi
+
+    sed -i -E "s|Environment=\"PANEL_USER=.*\"|Environment=\"PANEL_USER=${panel_user}\"|" "${PANEL_SERVICE_FILE}"
+    sed -i -E "s|Environment=\"PANEL_PASS=.*\"|Environment=\"PANEL_PASS=${panel_pass}\"|" "${PANEL_SERVICE_FILE}"
+    systemctl daemon-reload
+    if systemctl restart "${PANEL_SERVICE}"; then
+        info "面板登录信息已修改。"
+        echo "用户名: ${panel_user}"
+        echo "密码: ${panel_pass}"
+        log_action "修改 Web 面板登录信息"
+    else
+        err "面板重启失败，请查看: journalctl -u ${PANEL_SERVICE} -n 50"
+        return 1
+    fi
+}
+
 do_panel_menu() {
     while true; do
         echo ""
@@ -2565,18 +2608,20 @@ do_panel_menu() {
         echo "  1) 安装/更新 Web 面板"
         echo "  2) 卸载 Web 面板"
         echo "  3) 修改面板端口"
-        echo "  4) 查看面板状态"
-        echo "  5) 返回主菜单"
+        echo "  4) 修改登录信息"
+        echo "  5) 查看面板状态"
+        echo "  6) 返回主菜单"
         echo "========================================"
-        read -rp "请选择操作 [1-5]: " panel_choice
+        read -rp "请选择操作 [1-6]: " panel_choice
 
         case "$panel_choice" in
             1) install_panel ;;
             2) uninstall_panel ;;
             3) update_panel_port ;;
-            4) systemctl status "${PANEL_SERVICE}" --no-pager || true ;;
-            5) break ;;
-            *) err "无效选择，请输入 1-5。" ;;
+            4) update_panel_login ;;
+            5) systemctl status "${PANEL_SERVICE}" --no-pager || true ;;
+            6) break ;;
+            *) err "无效选择，请输入 1-6。" ;;
         esac
     done
 }
