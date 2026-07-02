@@ -2328,6 +2328,7 @@ import html
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import ssl
@@ -2353,6 +2354,12 @@ PANEL_PORT = int(os.environ.get("PANEL_PORT", "4788"))
 PANEL_HOST = os.environ.get("PANEL_HOST", "0.0.0.0")
 PANEL_CERT = os.environ.get("PANEL_CERT", "")
 PANEL_KEY = os.environ.get("PANEL_KEY", "")
+PANEL_BG_PC = os.environ.get("PANEL_BG_PC", "https://img.inim.im/file/1769439286929_61891168f564c650f6fb03d1962e5f37.jpeg")
+PANEL_BG_MOBILE = os.environ.get("PANEL_BG_MOBILE", "https://img.inim.im/file/1764296937373_bg_m_2.png")
+
+SESSION_TTL = 7 * 24 * 3600
+SESSIONS = {}
+LOGIN_FAILS = {}
 
 def sh(cmd, check=False):
     return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
@@ -2717,6 +2724,30 @@ def test_connectivity(host, port, timeout_sec):
         elapsed = int((time.monotonic() - started) * 1000)
         return {"ok": False, "host": host, "port": int(port), "elapsed_ms": elapsed, "error": str(e)}
 
+LOGIN_HTML = r"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>&#x767b;&#x5f55; - nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,ui-sans-serif,sans-serif;background-color:#dce8f5;background-image:url('{{BG_PC}}'),linear-gradient(135deg,#e2f0ff 0%,#ebf7f2 42%,#f5eeff 100%);background-position:center;background-size:cover;background-repeat:no-repeat;color:#374151}
+@media(max-width:768px){body{background-image:url('{{BG_MOBILE}}'),linear-gradient(135deg,#e2f0ff 0%,#ebf7f2 42%,#f5eeff 100%)}}
+.overlay{position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.05)}
+.box{position:relative;z-index:2;background:rgba(255,255,255,0.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,0.4);box-shadow:0 8px 32px rgba(0,0,0,0.05);width:90%;max-width:380px;text-align:center}
+.mark{width:44px;height:44px;margin:0 auto 1rem;border-radius:12px;background:rgba(59,130,246,.92);color:#fff;display:grid;place-items:center;font-weight:900;font-size:20px;box-shadow:0 10px 28px rgba(37,99,235,.25)}
+h2{margin-bottom:2rem;color:#374151;font-weight:600;letter-spacing:1px;font-size:1.2rem}
+input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,0.5);border-radius:12px;outline:none;background:rgba(255,255,255,0.5);transition:.3s;color:#374151;font-size:1rem}
+input:focus{background:rgba(255,255,255,0.9);border-color:#3b82f6}
+button{width:100%;padding:14px;background:rgba(59,130,246,0.85);color:#fff;border:none;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem;transition:.3s;backdrop-filter:blur(5px)}
+button:hover{background:#2563eb;transform:translateY(-1px)}
+button:disabled{opacity:.65;cursor:not-allowed;transform:none}
+.err{min-height:20px;margin:-0.4rem 0 .6rem;color:#dc2626;font-size:13px}
+</style></head><body><div class="overlay"></div>
+<div class="box"><div class="mark">N</div><h2>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</h2>
+<form id="f"><input type="text" id="u" placeholder="&#x7528;&#x6237;&#x540d;" autocomplete="username" required><input type="password" id="p" placeholder="&#x5bc6;&#x7801;" autocomplete="current-password" required><div class="err" id="err"></div><button type="submit" id="btn">&#x767b; &#x5f55;</button></form></div>
+<script>
+document.getElementById('f').addEventListener('submit',async e=>{e.preventDefault();const btn=document.getElementById('btn'),err=document.getElementById('err');btn.disabled=true;btn.textContent='登录中...';err.textContent='';try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});if(r.ok){location.href='/'}else{const d=await r.json().catch(()=>({}));err.textContent=d.error||'用户名或密码错误';btn.disabled=false;btn.textContent='登 录'}}catch(_){err.textContent='网络错误，请重试';btn.disabled=false;btn.textContent='登 录'}});
+</script></body></html>"""
+
 HTML = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</title>
@@ -2730,8 +2761,8 @@ button{height:38px;border:0;border-radius:10px;padding:0 14px;background:rgba(59
 table{width:100%;border-collapse:separate;border-spacing:0 10px;padding:0 14px 14px}th,td{text-align:left;vertical-align:middle}th{position:sticky;top:0;padding:13px 12px;font-size:12px;letter-spacing:0;text-transform:uppercase;color:#64748b;background:rgba(255,255,255,.42);backdrop-filter:blur(15px)}td{font-size:14px;background:rgba(255,255,255,.52);padding:12px}tr td:first-child{border-radius:13px 0 0 13px}tr td:last-child{border-radius:0 13px 13px 0}.target{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.namecell{font-weight:780}.badge{display:inline-flex;align-items:center;gap:6px;min-height:24px;border-radius:999px;padding:3px 9px;font-size:12px;font-weight:750}.badge.blue{background:var(--soft-blue);color:#1d4ed8}.badge.green{background:var(--soft-green);color:#047857}.badge.amber{background:var(--soft-amber);color:#92400e}.testout{display:inline-flex;margin-left:8px;font-size:12px;font-weight:750;color:#64748b;white-space:nowrap}.testout.ok{color:#047857}.testout.bad{color:#dc2626}.empty{padding:52px 20px;text-align:center;color:#64748b}.empty strong{display:block;color:#334155;margin-bottom:6px;font-size:15px}
 .form{padding:16px;display:grid;grid-template-columns:1.2fr 1fr 1fr 1.2fr auto;gap:12px;align-items:end}.form.unified-fields{grid-template-columns:1.2fr 1fr 1.8fr auto}.form.dns-fields{grid-template-columns:1.4fr 1fr 1fr 1fr auto}.field{display:grid;gap:6px;min-width:0}.field label{font-size:12px;color:#526071;font-weight:750}input{width:100%;min-width:0;height:38px;border:1px solid rgba(255,255,255,.58);border-radius:10px;padding:0 11px;font-size:14px;background:rgba(255,255,255,.58);color:#111827}input:focus{outline:2px solid rgba(147,197,253,.75);border-color:rgba(96,165,250,.75)}.side-note{padding:12px 14px;margin:0 16px 16px;border-radius:12px;background:rgba(255,255,255,.36);border:1px solid rgba(255,255,255,.46);color:#526071;font-size:13px}.msg{position:fixed;right:20px;bottom:20px;max-width:min(460px,calc(100vw - 40px));white-space:pre-wrap;background:rgba(15,23,42,.88);color:#e5e7eb;border-radius:12px;padding:13px 15px;display:none;font-size:13px;box-shadow:0 18px 50px rgba(15,23,42,.25);z-index:10}.msg.show{display:block}.msg.error{background:rgba(127,29,29,.92)}.msg.success{background:rgba(6,78,59,.92)}
 @media(max-width:980px){body{background-attachment:scroll}.form,.form.dns-fields{grid-template-columns:repeat(2,minmax(0,1fr))}.form button{grid-column:1/-1}.toolbar{align-items:flex-start;flex-direction:column}.actions{width:100%}.actions button{flex:1}.topbar{padding:0 16px}}
-@media(max-width:680px){.wrap{padding:14px}.form,.form.dns-fields{grid-template-columns:1fr}.topmeta{display:none}.brand span{font-size:15px}table{border-spacing:0;padding:0}th{display:none}tr{display:block;border-bottom:1px solid rgba(255,255,255,.30);padding:9px 0;background:rgba(255,255,255,.42)}td{display:flex;justify-content:space-between;gap:14px;border:0;background:transparent;padding:7px 14px;word-break:break-all}tr td:first-child,tr td:last-child{border-radius:0}td:before{content:attr(data-label);color:#64748b;font-size:12px;font-weight:700;flex:0 0 auto}.namecell{font-weight:800}}
-</style></head><body><div class="shell"><header class="topbar"><div class="brand"><div class="mark">N</div><span>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</span></div><div class="topmeta"><span id="last">&#x6b63;&#x5728;&#x52a0;&#x8f7d;</span></div></header>
+@media(max-width:680px){.wrap{padding:14px}.form,.form.dns-fields{grid-template-columns:1fr}.topmeta #last{display:none}.brand span{font-size:15px}table{border-spacing:0;padding:0}th{display:none}tr{display:block;border-bottom:1px solid rgba(255,255,255,.30);padding:9px 0;background:rgba(255,255,255,.42)}td{display:flex;justify-content:space-between;gap:14px;border:0;background:transparent;padding:7px 14px;word-break:break-all}tr td:first-child,tr td:last-child{border-radius:0}td:before{content:attr(data-label);color:#64748b;font-size:12px;font-weight:700;flex:0 0 auto}.namecell{font-weight:800}}
+</style></head><body><div class="shell"><header class="topbar"><div class="brand"><div class="mark">N</div><span>nftables &#x8f6c;&#x53d1;&#x9762;&#x677f;</span></div><div class="topmeta"><span id="last">&#x6b63;&#x5728;&#x52a0;&#x8f7d;</span><button class="ghost small" id="logoutBtn">&#x9000;&#x51fa;&#x767b;&#x5f55;</button></div></header>
 <main class="wrap"><div class="toolbar"><div class="title"><h1>&#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x63a7;&#x5236;&#x53f0;</h1><p>&#x7ba1;&#x7406; nftables &#x8f6c;&#x53d1;&#x89c4;&#x5219;&#x4e0e;&#x91cd;&#x8f7d;&#x72b6;&#x6001;&#x3002;</p></div><div class="actions"><button class="ghost" id="refreshBtn">&#x5237;&#x65b0;</button><button class="ghost" id="exportBtn">&#x5bfc;&#x51fa;</button><button class="ghost" id="importBtn">&#x5bfc;&#x5165;</button><button class="secondary" id="reloadBtn">&#x91cd;&#x8f7d; nft</button><input id="importFile" type="file" accept="application/json,.json" style="display:none"></div></div>
 <div class="status-grid"><div class="metric"><div class="label">nftables</div><div class="value" id="nftState">-</div><div class="hint">&#x7cfb;&#x7edf;&#x670d;&#x52a1;&#x72b6;&#x6001;</div></div><div class="metric"><div class="label">Web &#x9762;&#x677f;</div><div class="value" id="panelState">-</div><div class="hint">&#x9762;&#x677f;&#x670d;&#x52a1;</div></div><div class="metric"><div class="label">&#x666e;&#x901a;&#x8f6c;&#x53d1;</div><div class="value" id="portCount">0</div><div class="hint">DNAT &#x89c4;&#x5219;&#x6570;&#x91cf;</div></div><div class="metric"><div class="label">DNS &#x8f6c;&#x53d1;</div><div class="value" id="dnsCount">0</div><div class="hint">&#x57df;&#x540d;&#x89c4;&#x5219;&#x6570;&#x91cf;</div></div></div>
 <div id="msg" class="msg"></div><div class="stack"><section class="panel"><div class="panel-head"><h2>&#x65b0;&#x589e;&#x89c4;&#x5219;</h2><span class="badge green">&#x81ea;&#x52a8;&#x91cd;&#x8f7d;</span></div><div class="tabs" id="formTabs"><button class="tab active" data-form="port">&#x666e;&#x901a;</button><button class="tab" data-form="dns">DNS</button></div><div id="portForm" class="form unified-fields"><div class="field"><label>&#x540d;&#x79f0;</label><input id="name" placeholder="&#x4f8b;&#x5982; web-api"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="lport" placeholder="10000"></div><div class="field"><label>&#x76ee;&#x6807;&#x5730;&#x5740;</label><input id="target" placeholder="1.2.3.4:443 ? example.com:443"></div><button id="addRuleBtn">&#x6dfb;&#x52a0;&#x8f6c;&#x53d1;</button></div><div id="dnsForm" class="form dns-fields" style="display:none"><div class="field"><label>&#x57df;&#x540d;</label><input id="domain" placeholder="example.com"></div><div class="field"><label>&#x672c;&#x673a;&#x7aef;&#x53e3;</label><input id="dlport" placeholder="10001"></div><div class="field"><label>&#x76ee;&#x6807;&#x7aef;&#x53e3;</label><input id="ddport" placeholder="443"></div><div class="field"><label>nft set</label><input id="setname" placeholder="&#x53ef;&#x7559;&#x7a7a;"></div><button id="addDnsBtn">&#x6dfb;&#x52a0; DNS &#x8f6c;&#x53d1;</button></div><p class="side-note">&#x76ee;&#x6807;&#x5730;&#x5740;&#x53ef;&#x76f4;&#x63a5;&#x586b; IP:&#x7aef;&#x53e3; &#x6216; &#x57df;&#x540d;:&#x7aef;&#x53e3;&#xff1b;&#x57df;&#x540d;&#x4f1a;&#x81ea;&#x52a8;&#x5199;&#x5165; DNS &#x52a8;&#x6001;&#x8f6c;&#x53d1;&#x3002;&#x7248;&#x672c; <span id="panelVersion">2026.06.27.9</span></p></section>
@@ -2739,7 +2770,7 @@ table{width:100%;border-collapse:separate;border-spacing:0 10px;padding:0 14px 1
 <script>
 const $=id=>document.getElementById(id);let editPort=null;let editDns=null;
 function showMsg(t,type='success'){const el=$('msg');el.textContent=t;el.className='msg show '+type;clearTimeout(window.msgTimer);window.msgTimer=setTimeout(()=>{el.className='msg'},4200)}
-async function api(url,opt){const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.statusText);return d}
+async function api(url,opt){const r=await fetch(url,opt);if(r.status===401){location.href='/login';throw new Error('登录已过期，请重新登录')}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.statusText);return d}
 function stateClass(v){return v==='active'?'ok':(v==='inactive'||!v?'warn':'bad')}
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function switchForm(tab){document.querySelectorAll('#formTabs .tab').forEach((b,i)=>b.classList.toggle('active',(tab==='port'?i===0:i===1)));$('portForm').style.display=tab==='port'?'grid':'none';$('dnsForm').style.display=tab==='dns'?'grid':'none'}
@@ -2756,10 +2787,12 @@ async function reloadRules(){try{await api('/api/reload',{method:'POST'});showMs
 function exportRules(){window.location.href='/api/export'}
 async function importRules(file){if(!file)return;if(!confirm('\u5bfc\u5165\u540e\u4f1a\u8986\u76d6\u5f53\u524d\u9762\u677f\u89c4\u5219\uff0c\u786e\u8ba4\u7ee7\u7eed\uff1f'))return;try{const text=await file.text();const data=JSON.parse(text);const res=await api('/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});showMsg('\u5bfc\u5165\u5b8c\u6210\uff1a\u666e\u901a '+res.port_count+' \u6761\uff0cDNS '+res.dns_count+' \u6761\u3002');load()}catch(e){showMsg('\u5bfc\u5165\u5931\u8d25\uff1a'+e.message,'error')}finally{$('importFile').value=''}}
 async function testConn(btn){const out=btn.parentElement.querySelector('.testout');btn.disabled=true;out.textContent='\u6d4b\u8bd5\u4e2d...';out.className='testout';try{const d=await api('/api/test',{method:'POST',body:JSON.stringify({host:btn.dataset.host,port:btn.dataset.port,timeout:3})});if(d.ok){out.textContent='\u53ef\u8fbe '+d.elapsed_ms+'ms';out.className='testout ok'}else{out.textContent='\u5931\u8d25 '+d.elapsed_ms+'ms';out.className='testout bad';showMsg((d.host||btn.dataset.host)+':'+(d.port||btn.dataset.port)+' '+(d.error||'\u4e0d\u53ef\u8fbe'),'error')}}catch(e){out.textContent='\u5931\u8d25';out.className='testout bad';showMsg(e.message,'error')}finally{btn.disabled=false}}
-$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('exportBtn').addEventListener('click',exportRules);$('importBtn').addEventListener('click',()=>$('importFile').click());$('importFile').addEventListener('change',e=>importRules(e.target.files[0]));$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.addEventListener('click',e=>{const delBtn=e.target.closest('.delbtn');if(delBtn)del(delBtn.dataset.kind,delBtn.dataset.id);const testBtn=e.target.closest('.testbtn');if(testBtn)testConn(testBtn);const editBtn=e.target.closest('.editbtn');if(editBtn)edit(editBtn)});load();
+$('logoutBtn').addEventListener('click',async()=>{try{await fetch('/api/logout',{method:'POST'})}catch(_){}location.href='/login'});$('refreshBtn').addEventListener('click',load);$('reloadBtn').addEventListener('click',reloadRules);$('exportBtn').addEventListener('click',exportRules);$('importBtn').addEventListener('click',()=>$('importFile').click());$('importFile').addEventListener('change',e=>importRules(e.target.files[0]));$('addRuleBtn').addEventListener('click',addRule);$('addDnsBtn').addEventListener('click',addDns);document.querySelectorAll('#formTabs .tab').forEach(btn=>btn.addEventListener('click',()=>switchForm(btn.dataset.form)));document.addEventListener('click',e=>{const delBtn=e.target.closest('.delbtn');if(delBtn)del(delBtn.dataset.kind,delBtn.dataset.id);const testBtn=e.target.closest('.testbtn');if(testBtn)testConn(testBtn);const editBtn=e.target.closest('.editbtn');if(editBtn)edit(editBtn)});load();
 </script></body></html>"""
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 30
+
     def ok(self, data):
         raw = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(HTTPStatus.OK)
@@ -2776,41 +2809,124 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def session_token(self):
+        header = self.headers.get("Cookie", "")
+        for part in header.split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == "auth_session":
+                return value
+        return ""
+
     def auth_ok(self):
+        token = self.session_token()
+        if token:
+            now = time.time()
+            expiry = SESSIONS.get(token)
+            if expiry and expiry > now:
+                SESSIONS[token] = now + SESSION_TTL
+                return True
+            if expiry:
+                SESSIONS.pop(token, None)
         header = self.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            return False
-        try:
-            user_pass = base64.b64decode(header.split(" ", 1)[1]).decode()
-        except Exception:
-            return False
-        return user_pass == PANEL_USER + ":" + PANEL_PASS
+        if header.startswith("Basic "):
+            try:
+                user_pass = base64.b64decode(header.split(" ", 1)[1]).decode()
+            except Exception:
+                return False
+            return user_pass == PANEL_USER + ":" + PANEL_PASS
+        return False
 
     def require_auth(self):
         if self.auth_ok():
             return True
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", 'Basic realm="nft-forward-panel"')
-        self.end_headers()
+        self.fail(HTTPStatus.UNAUTHORIZED, "unauthorized")
         return False
+
+    def redirect(self, location):
+        self.send_response(HTTPStatus.FOUND)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def send_page(self, raw, extra_headers=None):
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def handle_login(self):
+        ip = self.client_address[0]
+        now = time.time()
+        count, until = LOGIN_FAILS.get(ip, (0, 0))
+        if until > now and count >= 5:
+            self.fail(HTTPStatus.UNAUTHORIZED, "尝试次数过多，请 10 分钟后再试")
+            return
+        try:
+            data = self.body()
+        except Exception:
+            self.fail(HTTPStatus.BAD_REQUEST, "请求格式错误")
+            return
+        user = str(data.get("username", ""))
+        password = str(data.get("password", ""))
+        if not (secrets.compare_digest(user, PANEL_USER) and secrets.compare_digest(password, PANEL_PASS)):
+            LOGIN_FAILS[ip] = ((count + 1) if until > now else 1, now + 600)
+            log("panel login failed from %s" % ip)
+            time.sleep(1)
+            self.fail(HTTPStatus.UNAUTHORIZED, "用户名或密码错误")
+            return
+        LOGIN_FAILS.pop(ip, None)
+        for stale in [t for t, exp in list(SESSIONS.items()) if exp <= now]:
+            SESSIONS.pop(stale, None)
+        token = secrets.token_hex(32)
+        SESSIONS[token] = now + SESSION_TTL
+        cookie = "auth_session=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (token, SESSION_TTL)
+        if PANEL_CERT and PANEL_KEY:
+            cookie += "; Secure"
+        raw = json.dumps({"status": "ok"}).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+        log("panel login ok from %s" % ip)
+
+    def handle_logout(self):
+        SESSIONS.pop(self.session_token(), None)
+        raw = json.dumps({"status": "ok"}).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", "auth_session=; Path=/; HttpOnly; Max-Age=0")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def body(self):
         n = int(self.headers.get("Content-Length", "0") or "0")
         return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
 
     def do_GET(self):
-        if not self.require_auth():
+        if self.path == "/login":
+            if self.auth_ok():
+                self.redirect("/")
+                return
+            raw = LOGIN_HTML.replace("{{BG_PC}}", PANEL_BG_PC).replace("{{BG_MOBILE}}", PANEL_BG_MOBILE).encode("utf-8")
+            self.send_page(raw)
             return
         if self.path == "/":
-            raw = HTML.encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-        elif self.path == "/api/state":
+            if not self.auth_ok():
+                self.redirect("/login")
+                return
+            self.send_page(HTML.encode("utf-8"))
+            return
+        if not self.require_auth():
+            return
+        if self.path == "/api/state":
             self.ok(status())
         elif self.path == "/api/export":
             raw = json.dumps(export_rules_data(), ensure_ascii=False, indent=2).encode("utf-8")
@@ -2825,6 +2941,12 @@ class Handler(BaseHTTPRequestHandler):
             self.fail(HTTPStatus.NOT_FOUND, "not found")
 
     def do_POST(self):
+        if self.path == "/api/login":
+            self.handle_login()
+            return
+        if self.path == "/api/logout":
+            self.handle_logout()
+            return
         if not self.require_auth():
             return
         try:
@@ -2961,7 +3083,7 @@ if __name__ == "__main__":
     if PANEL_CERT and PANEL_KEY:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(PANEL_CERT, PANEL_KEY)
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
         scheme = "https"
     print("nft-forward-panel listening on %s://%s:%d" % (scheme, PANEL_HOST, PANEL_PORT), flush=True)
     httpd.serve_forever()
