@@ -3125,10 +3125,10 @@ class Handler(BaseHTTPRequestHandler):
                     target = str(data.get("dip", "")).strip().lower()
                     dport = str(data.get("dport", ""))
                 if not valid_port(lport) or not valid_port(dport) or not (valid_ip(target) or valid_forward_domain(target)):
-                    raise ValueError("???????????????? host:port")
+                    raise ValueError("本机端口或目标端口或地址格式无效，目标地址应为 host:port")
                 old_lport = str(data.get("old_lport") or lport)
                 if not valid_port(old_lport):
-                    raise ValueError("?????????")
+                    raise ValueError("原端口格式无效")
 
                 old_port_rules = load_rules()
                 removed = [r for r in old_port_rules if r["lport"] == old_lport]
@@ -3219,11 +3219,11 @@ class Handler(BaseHTTPRequestHandler):
                 if key.isdigit():
                     idx = int(key)
                     if idx < 0 or idx >= len(rules):
-                        raise ValueError("????")
+                        raise ValueError("规则序号无效")
                     old_rule = rules.pop(idx)
                 else:
                     if "|" not in key:
-                        raise ValueError("??????")
+                        raise ValueError("参数格式无效")
                     domain, lport = key.split("|", 1)
                     kept = []
                     for r in rules:
@@ -3232,7 +3232,7 @@ class Handler(BaseHTTPRequestHandler):
                         else:
                             kept.append(r)
                     if old_rule is None:
-                        raise ValueError("?????")
+                        raise ValueError("规则不存在")
                     rules = kept
                 backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft()
                 if rules:
