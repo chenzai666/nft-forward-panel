@@ -321,6 +321,43 @@ detect_pkg_manager() {
     fi
 }
 
+ensure_python3() {
+    if command -v python3 &>/dev/null; then
+        return 0
+    fi
+
+    local pkg_mgr
+    pkg_mgr=$(detect_pkg_manager)
+
+    info "未检测到 python3，准备自动安装..."
+    case "$pkg_mgr" in
+        apt)
+            apt-get update -y && DEBIAN_FRONTEND=noninteractive apt-get install -y python3
+            ;;
+        dnf)
+            dnf install -y python3
+            ;;
+        yum)
+            yum install -y python3
+            ;;
+        pacman)
+            pacman -Sy --noconfirm python
+            ;;
+        *)
+            err "无法识别包管理器，请手动安装 python3。"
+            return 1
+            ;;
+    esac
+
+    if ! command -v python3 &>/dev/null; then
+        err "python3 自动安装失败，请手动安装 python3。"
+        return 1
+    fi
+
+    info "python3 安装完成。"
+    return 0
+}
+
 # ============== iptables 可用性检测 ==============
 has_iptables() {
     command -v iptables &>/dev/null && iptables -S &>/dev/null
@@ -2314,10 +2351,7 @@ install_panel() {
         panel_key=""
     fi
 
-    if ! command -v python3 &>/dev/null; then
-        err "未检测到 python3，请先安装 python3。"
-        return 1
-    fi
+    ensure_python3 || return 1
 
     mkdir -p "${CONF_DIR}" "${BACKUP_DIR}" 2>/dev/null || true
 
