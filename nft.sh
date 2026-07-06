@@ -1957,6 +1957,8 @@ if [[ "$changed" -eq 1 ]]; then
         done < "$CONF_USER"
 
         echo ""
+        echo "    }"
+        echo ""
         echo "    chain dns_postrouting { type nat hook postrouting priority 100; policy accept;"
 
         # SNAT 规则
@@ -2713,6 +2715,8 @@ if [[ "$changed" -eq 1 ]]; then
             done
         done < "$CONF_USER"
 
+        echo ""
+        echo "    }"
         echo ""
         echo "    chain dns_postrouting { type nat hook postrouting priority 100; policy accept;"
 
