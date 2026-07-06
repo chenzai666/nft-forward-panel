@@ -2469,6 +2469,24 @@ def unique_set_name(base, rules, skip_index=None):
             return candidate
     raise ValueError("nft set 名称冲突过多")
 
+def dns_rule_index(rules, key):
+    if key in (None, ""):
+        return None
+    key = str(key).strip()
+    if key.isdigit():
+        idx = int(key)
+        if idx < 0 or idx >= len(rules):
+            raise ValueError("规则序号无效")
+        return idx
+    if "|" not in key:
+        raise ValueError("参数格式无效")
+    domain, lport = key.split("|", 1)
+    domain, lport = domain.strip().lower(), lport.strip()
+    for idx, rule in enumerate(rules):
+        if rule.get("domain") == domain and rule.get("lport") == lport:
+            return idx
+    raise ValueError("规则不存在")
+
 def get_local_ip():
     for cmd in (["ip", "route", "get", "1.1.1.1"], ["hostname", "-I"]):
         try:
@@ -3198,14 +3216,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("域名或端口格式无效")
                 rules = load_dns_rules()
                 old_index = data.get("old_index")
-                skip_index = int(old_index) if old_index not in (None, "") else None
+                skip_index = dns_rule_index(rules, old_index)
                 set_name = unique_set_name(data.get("set_name") or ("%s_%s" % (domain.replace(".", "_").replace("-", "_"), lport)), rules, skip_index)
                 old_rule = None
-                if old_index not in (None, ""):
-                    old_index = int(old_index)
-                    if old_index < 0 or old_index >= len(rules):
-                        raise ValueError("原规则序号无效")
-                    old_rule = rules.pop(old_index)
+                if skip_index is not None:
+                    old_rule = rules.pop(skip_index)
                 rules = [r for r in rules if not (r["domain"] == domain and r["lport"] == lport)]
                 rules.append({"domain": domain, "lport": lport, "dport": dport, "set_name": set_name})
                 backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft(); open_firewall_port(lport)
@@ -3249,25 +3264,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) == 3 and parts[0] == "api" and parts[1] == "dns":
                 key = unquote(parts[2])
                 rules = load_dns_rules()
-                old_rule = None
-                if key.isdigit():
-                    idx = int(key)
-                    if idx < 0 or idx >= len(rules):
-                        raise ValueError("规则序号无效")
-                    old_rule = rules.pop(idx)
-                else:
-                    if "|" not in key:
-                        raise ValueError("参数格式无效")
-                    domain, lport = key.split("|", 1)
-                    kept = []
-                    for r in rules:
-                        if old_rule is None and r.get("domain") == domain and r.get("lport") == lport:
-                            old_rule = r
-                        else:
-                            kept.append(r)
-                    if old_rule is None:
-                        raise ValueError("规则不存在")
-                    rules = kept
+                idx = dns_rule_index(rules, key)
+                old_rule = rules.pop(idx)
                 backup(DNS_USER_CONF); write_dns_user_rules(rules); write_dns_nft(rules); reload_nft()
                 if rules:
                     ensure_dns_sync_timer()
