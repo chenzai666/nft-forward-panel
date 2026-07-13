@@ -191,6 +191,120 @@ ensure_acme_auto_renew() {
     warn "可手动检查: crontab -l | grep acme.sh"
 }
 
+NGINX_WAS_RUNNING=0
+NGINX_CONTROL_METHOD=""
+
+nginx_is_running() {
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet nginx; then
+        return 0
+    fi
+
+    if command -v service &>/dev/null && service nginx status >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v pgrep &>/dev/null && pgrep -x nginx >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+detect_running_nginx() {
+    NGINX_CONTROL_METHOD=""
+
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet nginx; then
+        NGINX_CONTROL_METHOD="systemctl"
+        return 0
+    fi
+
+    if command -v service &>/dev/null && service nginx status >/dev/null 2>&1; then
+        NGINX_CONTROL_METHOD="service"
+        return 0
+    fi
+
+    if command -v pgrep &>/dev/null && pgrep -x nginx >/dev/null 2>&1; then
+        NGINX_CONTROL_METHOD="nginx"
+        return 0
+    fi
+
+    return 1
+}
+
+wait_for_nginx_to_stop() {
+    local _
+
+    for _ in {1..10}; do
+        nginx_is_running || return 0
+        sleep 1
+    done
+
+    return 1
+}
+
+stop_nginx_for_acme() {
+    NGINX_WAS_RUNNING=0
+
+    if ! detect_running_nginx; then
+        return 0
+    fi
+
+    warn "检测到 nginx 正在运行，将临时停止以释放 80 端口供 IP 证书验证使用。"
+    case "$NGINX_CONTROL_METHOD" in
+        systemctl)
+            systemctl stop nginx
+            ;;
+        service)
+            service nginx stop
+            ;;
+        nginx)
+            if ! command -v nginx &>/dev/null; then
+                err "检测到 nginx 进程，但未找到 nginx 命令，无法安全停止。"
+                return 1
+            fi
+            nginx -s quit
+            ;;
+    esac
+
+    if wait_for_nginx_to_stop; then
+        NGINX_WAS_RUNNING=1
+        info "nginx 已临时停止。"
+        return 0
+    fi
+
+    err "无法停止 nginx，已取消 IP 证书申请以避免 standalone 验证失败。"
+    return 1
+}
+
+restore_nginx_after_acme() {
+    [[ "$NGINX_WAS_RUNNING" -eq 1 ]] || return 0
+
+    info "IP 证书申请已结束，正在恢复 nginx。"
+    case "$NGINX_CONTROL_METHOD" in
+        systemctl)
+            systemctl start nginx
+            ;;
+        service)
+            service nginx start
+            ;;
+        nginx)
+            nginx
+            ;;
+        *)
+            err "无法确定 nginx 的启动方式，请手动恢复 nginx。"
+            return 1
+            ;;
+    esac
+
+    if nginx_is_running; then
+        info "nginx 已恢复运行。"
+        return 0
+    fi
+
+    err "nginx 恢复失败，请执行相应的启动命令后检查服务状态。"
+    return 1
+}
+
 issue_ip_certificate() {
     local cert_ip="$1"
     local cert_path="$2"
@@ -212,8 +326,12 @@ issue_ip_certificate() {
     "$acme_bin" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     "$acme_bin" --upgrade --auto-upgrade >/dev/null 2>&1 || true
 
-    if ! "$acme_bin" --issue --server letsencrypt --standalone -d "$cert_ip" \
-        --certificate-profile shortlived --days 3 --force; then
+    if ! (
+        stop_nginx_for_acme || exit 1
+        trap 'restore_nginx_after_acme || exit 1' EXIT
+        "$acme_bin" --issue --server letsencrypt --standalone -d "$cert_ip" \
+            --certificate-profile shortlived --days 3 --force
+    ); then
         err "IP 证书申请失败。请确认公网 IP 正确、80 端口未被占用且防火墙/安全组已放行。"
         return 1
     fi
