@@ -30,6 +30,8 @@ PANEL_USER_DEFAULT="admin"
 PANEL_PASS_DEFAULT="admin123"
 PANEL_CERT_DEFAULT="/root/ygkkkca/cert.crt"
 PANEL_KEY_DEFAULT="/root/ygkkkca/private.key"
+PANEL_CERT_IP_FILE="${CONF_DIR}/panel-cert-ip"
+ACME_RENEW_HOOK="/usr/local/bin/nft-forward-acme-hook"
 
 # ============== 日志函数 ==============
 log_action() {
@@ -177,18 +179,237 @@ ensure_acme_sh() {
 }
 
 ensure_acme_auto_renew() {
-    local acme_bin="$1"
+    local acme_bin="$1" cron_ready=0
 
+    ensure_cron_runtime && cron_ready=1
     "$acme_bin" --upgrade --auto-upgrade >/dev/null 2>&1 || true
     "$acme_bin" --install-cronjob >/dev/null 2>&1 || true
 
-    if command -v crontab &>/dev/null && crontab -l 2>/dev/null | grep -q "acme.sh.*--cron"; then
+    if (( cron_ready )) && command -v crontab &>/dev/null && crontab -l 2>/dev/null | grep -q "acme.sh.*--cron"; then
         info "已确认 acme.sh 自动续期任务。"
         return 0
     fi
 
     warn "未检测到 acme.sh cron 续期任务。证书已安装，但请确认系统允许 cron 运行。"
     warn "可手动检查: crontab -l | grep acme.sh"
+    return 1
+}
+
+ensure_cron_runtime() {
+    local pkg_mgr cron_service=""
+
+    if ! command -v crontab &>/dev/null; then
+        pkg_mgr=$(detect_pkg_manager)
+        warn "未检测到 crontab，将安装 cron 以保证 acme.sh 能自动续期。"
+        case "$pkg_mgr" in
+            apt)
+                apt-get update -y >/dev/null 2>&1 || true
+                DEBIAN_FRONTEND=noninteractive apt-get install -y cron >/dev/null 2>&1 || true
+                ;;
+            dnf)
+                dnf install -y cronie >/dev/null 2>&1 || true
+                ;;
+            yum)
+                yum install -y cronie >/dev/null 2>&1 || true
+                ;;
+            pacman)
+                pacman -Sy --noconfirm cronie >/dev/null 2>&1 || true
+                ;;
+        esac
+    fi
+
+    if ! command -v crontab &>/dev/null; then
+        warn "crontab 安装失败，acme.sh 自动续期任务无法注册。"
+        return 1
+    fi
+
+    if command -v systemctl &>/dev/null; then
+        for cron_service in cron crond; do
+            if systemctl list-unit-files "${cron_service}.service" --no-legend 2>/dev/null | grep -q "${cron_service}.service"; then
+                systemctl enable --now "$cron_service" >/dev/null 2>&1 || true
+                systemctl is-active --quiet "$cron_service" && return 0
+            fi
+        done
+    fi
+
+    if command -v service &>/dev/null; then
+        service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+    fi
+
+    if command -v pgrep &>/dev/null && (pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1); then
+        return 0
+    fi
+
+    warn "cron/crond 未运行，acme.sh 自动续期任务不会按时执行。"
+    return 1
+}
+
+get_saved_cert_ip() {
+    local saved_ip=""
+
+    [[ -f "$PANEL_CERT_IP_FILE" ]] || return 1
+    IFS= read -r saved_ip < "$PANEL_CERT_IP_FILE" || true
+    validate_public_ipv4 "$saved_ip" || return 1
+    printf '%s\n' "$saved_ip"
+}
+
+save_cert_ip() {
+    local cert_ip="$1" tmp_file
+
+    validate_public_ipv4 "$cert_ip" || return 1
+    mkdir -p "$CONF_DIR" || return 1
+    tmp_file="${PANEL_CERT_IP_FILE}.tmp.$$"
+    if ! printf '%s\n' "$cert_ip" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$PANEL_CERT_IP_FILE"
+}
+
+install_acme_renew_hook() {
+    local hook_dir
+    hook_dir=$(dirname "$ACME_RENEW_HOOK")
+    mkdir -p "$hook_dir" || return 1
+
+    cat > "$ACME_RENEW_HOOK" <<'HOOK'
+#!/usr/bin/env bash
+
+STATE_FILE="/run/nft-forward-acme-nginx.state"
+
+nginx_running() {
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet nginx; then
+        return 0
+    fi
+    if command -v service &>/dev/null && service nginx status >/dev/null 2>&1; then
+        return 0
+    fi
+    command -v pgrep &>/dev/null && pgrep -x nginx >/dev/null 2>&1
+}
+
+case "${1:-}" in
+    pre)
+        rm -f "$STATE_FILE"
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet nginx; then
+            printf '%s\n' systemctl > "$STATE_FILE"
+            systemctl stop nginx || exit 1
+        elif command -v service &>/dev/null && service nginx status >/dev/null 2>&1; then
+            printf '%s\n' service > "$STATE_FILE"
+            service nginx stop || exit 1
+        elif command -v pgrep &>/dev/null && pgrep -x nginx >/dev/null 2>&1; then
+            command -v nginx &>/dev/null || exit 1
+            printf '%s\n' nginx > "$STATE_FILE"
+            nginx -s quit || exit 1
+        else
+            exit 0
+        fi
+
+        for _ in {1..10}; do
+            nginx_running || exit 0
+            sleep 1
+        done
+        exit 1
+        ;;
+    post)
+        [[ -f "$STATE_FILE" ]] || exit 0
+        IFS= read -r method < "$STATE_FILE" || method=""
+        rm -f "$STATE_FILE"
+        case "$method" in
+            systemctl) systemctl start nginx ;;
+            service) service nginx start ;;
+            nginx) nginx ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    *)
+        echo "usage: $0 {pre|post}" >&2
+        exit 2
+        ;;
+esac
+HOOK
+
+    chmod 755 "$ACME_RENEW_HOOK"
+}
+
+get_cert_ip_from_file() {
+    local cert_path="$1" cert_ip=""
+
+    [[ -f "$cert_path" ]] || return 1
+    command -v openssl &>/dev/null || return 1
+    cert_ip=$(openssl x509 -in "$cert_path" -noout -ext subjectAltName 2>/dev/null \
+        | sed -nE 's/.*IP Address:([0-9.]+).*/\1/p' | head -1)
+    validate_public_ipv4 "$cert_ip" || return 1
+    printf '%s\n' "$cert_ip"
+}
+
+set_acme_domain_conf_value() {
+    local conf_file="$1" key="$2" value="$3"
+
+    [[ -f "$conf_file" ]] || return 1
+    if grep -q "^${key}=" "$conf_file"; then
+        sed -i -E "s|^${key}=.*|${key}='${value}'|" "$conf_file"
+    else
+        printf "%s='%s'\n" "$key" "$value" >> "$conf_file"
+    fi
+    chmod 600 "$conf_file" 2>/dev/null || true
+}
+
+configure_existing_acme_renew_hooks() {
+    local acme_bin="$1" cert_ip="$2"
+    local acme_real acme_home conf_file pre_value post_value seen="|" updated=0
+
+    validate_public_ipv4 "$cert_ip" || return 1
+    acme_real=$(readlink -f "$acme_bin" 2>/dev/null || printf '%s' "$acme_bin")
+    pre_value="__ACME_BASE64__START_$(printf '%s' "${ACME_RENEW_HOOK} pre" | openssl base64 -A)__ACME_BASE64__END_"
+    post_value="__ACME_BASE64__START_$(printf '%s' "${ACME_RENEW_HOOK} post" | openssl base64 -A)__ACME_BASE64__END_"
+
+    for acme_home in "$(dirname "$acme_real")" "${HOME}/.acme.sh" "/root/.acme.sh"; do
+        for conf_file in \
+            "${acme_home}/${cert_ip}/${cert_ip}.conf" \
+            "${acme_home}/${cert_ip}_ecc/${cert_ip}.conf"; do
+            [[ -f "$conf_file" ]] || continue
+            [[ "$seen" == *"|${conf_file}|"* ]] && continue
+            seen+="${conf_file}|"
+            set_acme_domain_conf_value "$conf_file" Le_PreHook "$pre_value" || return 1
+            set_acme_domain_conf_value "$conf_file" Le_PostHook "$post_value" || return 1
+            updated=$((updated + 1))
+        done
+    done
+
+    (( updated > 0 ))
+}
+
+repair_existing_ip_certificate_renewal() {
+    local cert_ip="$1" acme_bin
+
+    acme_bin=$(find_acme_sh 2>/dev/null || true)
+    if [[ -z "$acme_bin" ]]; then
+        warn "证书文件存在，但未找到 acme.sh，无法确认自动续期。"
+        return 1
+    fi
+    if ! install_acme_renew_hook; then
+        warn "无法安装 acme.sh 续期钩子。"
+        return 1
+    fi
+    if ! configure_existing_acme_renew_hooks "$acme_bin" "$cert_ip"; then
+        warn "未找到 ${cert_ip} 的 acme.sh 域配置，无法补写续期钩子。"
+        return 1
+    fi
+
+    ensure_acme_auto_renew "$acme_bin"
+}
+
+repair_panel_ip_certificate_renewal() {
+    local cert_path="$1" cert_ip
+
+    cert_ip=$(get_cert_ip_from_file "$cert_path" 2>/dev/null || get_saved_cert_ip 2>/dev/null || true)
+    if ! validate_public_ipv4 "$cert_ip"; then
+        warn "无法从现有证书识别公网 IP，已跳过自动续期修复。"
+        return 1
+    fi
+
+    save_cert_ip "$cert_ip" || warn "公网 IP 保存失败，下次配置时可能仍需重新输入。"
+    repair_existing_ip_certificate_renewal "$cert_ip"
 }
 
 NGINX_WAS_RUNNING=0
@@ -309,7 +530,7 @@ issue_ip_certificate() {
     local cert_ip="$1"
     local cert_path="$2"
     local key_path="$3"
-    local acme_bin cert_dir key_dir reload_cmd
+    local acme_bin cert_dir key_dir reload_cmd pre_hook post_hook
 
     acme_bin=$(ensure_acme_sh) || {
         err "acme.sh 准备失败，无法申请 IP 证书。"
@@ -319,6 +540,13 @@ issue_ip_certificate() {
     cert_dir=$(dirname "$cert_path")
     key_dir=$(dirname "$key_path")
     reload_cmd="systemctl restart ${PANEL_SERVICE}"
+    pre_hook="${ACME_RENEW_HOOK} pre"
+    post_hook="${ACME_RENEW_HOOK} post"
+
+    if ! install_acme_renew_hook; then
+        err "无法安装 acme.sh 续期钩子。"
+        return 1
+    fi
 
     warn "开始申请 Let's Encrypt 真实 IP 证书。"
     warn "要求：${cert_ip} 必须是本机公网 IP，并且公网 80 端口能访问到这台服务器。"
@@ -330,7 +558,8 @@ issue_ip_certificate() {
         stop_nginx_for_acme || exit 1
         trap 'restore_nginx_after_acme || exit 1' EXIT
         "$acme_bin" --issue --server letsencrypt --standalone -d "$cert_ip" \
-            --certificate-profile shortlived --days 3 --force
+            --certificate-profile shortlived --days 3 --force \
+            --pre-hook "$pre_hook" --post-hook "$post_hook"
     ); then
         err "IP 证书申请失败。请确认公网 IP 正确、80 端口未被占用且防火墙/安全组已放行。"
         return 1
@@ -3449,6 +3678,11 @@ EOF
         return 1
     }
 
+    if (( existing_panel )) && [[ -f "$panel_cert" && -f "$panel_key" ]]; then
+        repair_panel_ip_certificate_renewal "$panel_cert" \
+            || warn "现有证书仍可使用，但自动续期配置未完全修复。"
+    fi
+
     local ip
     ip=$(curl -s4 ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
     ip="${ip:-服务器IP}"
@@ -3535,7 +3769,7 @@ update_panel_tls() {
         return 1
     fi
 
-    local panel_host cert_path key_path cert_ip panel_port public_ip
+    local panel_host cert_path key_path cert_ip panel_port public_ip saved_cert_ip cert_ip_default
     read -rp "监听 IP [默认 0.0.0.0，填 127.0.0.1 可仅本机访问]: " panel_host
     panel_host="${panel_host:-0.0.0.0}"
     if ! validate_listen_host "$panel_host"; then
@@ -3572,9 +3806,17 @@ update_panel_tls() {
         }
         if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
             echo "证书或私钥不存在，将申请真实 IP 证书。"
-            if validate_public_ipv4 "$panel_host"; then
-                read -rp "证书 IP [默认 ${panel_host}]: " cert_ip
-                cert_ip="${cert_ip:-$panel_host}"
+            saved_cert_ip=$(get_saved_cert_ip 2>/dev/null || true)
+            cert_ip_default=""
+            if validate_public_ipv4 "$saved_cert_ip"; then
+                cert_ip_default="$saved_cert_ip"
+            elif validate_public_ipv4 "$panel_host"; then
+                cert_ip_default="$panel_host"
+            fi
+
+            if [[ -n "$cert_ip_default" ]]; then
+                read -rp "证书 IP [默认 ${cert_ip_default}]: " cert_ip
+                cert_ip="${cert_ip:-$cert_ip_default}"
             else
                 read -rp "证书 IP [必须填写服务器公网 IPv4，不能填 ${panel_host}]: " cert_ip
             fi
@@ -3584,10 +3826,17 @@ update_panel_tls() {
                 return 1
             fi
 
+            if ! save_cert_ip "$cert_ip"; then
+                warn "公网 IP 保存失败，下次配置时可能仍需重新输入。"
+            fi
+
             issue_ip_certificate "$cert_ip" "$cert_path" "$key_path" || {
                 err "HTTPS 配置未更新，仍保留当前面板配置。"
                 return 1
             }
+        else
+            repair_panel_ip_certificate_renewal "$cert_path" \
+                || warn "现有证书仍可使用，但自动续期配置未完全修复。"
         fi
     fi
 
