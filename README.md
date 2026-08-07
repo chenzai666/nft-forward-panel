@@ -11,8 +11,8 @@
 - Web 面板登录信息、端口、监听 IP 配置
 - 支持为面板申请真实 IP 证书，不生成自签证书
 - IP 证书默认安装路径：
-  - 证书：`/root/ygkkkca/cert.crt`
-  - 私钥：`/root/ygkkkca/private.key`
+  - 证书：`/etc/panel-ssl/nft-ip-cert.crt`
+  - 私钥：`/etc/panel-ssl/nft-ip-private.key`
 - 通过 acme.sh 自动续期 IP 证书，自动检查 cron/crond，续期后自动重启面板
 - 自动生成 nftables 配置
 - 可选防火墙端口放行
@@ -50,8 +50,8 @@ Web 面板入口在主菜单：
 证书和私钥路径直接回车会使用默认路径：
 
 ```text
-/root/ygkkkca/cert.crt
-/root/ygkkkca/private.key
+/etc/panel-ssl/nft-ip-cert.crt
+/etc/panel-ssl/nft-ip-private.key
 ```
 
 如果文件不存在，脚本会尝试使用 Let's Encrypt 申请真实 IP 证书。申请 IP 证书要求：
@@ -61,6 +61,7 @@ Web 面板入口在主菜单：
 - 系统可以安装并运行 `acme.sh`
 - 首次申请和定时续期时如果检测到 nginx 正在运行，脚本会临时停止 nginx 释放 80 端口；无论成功或失败，都会自动恢复 nginx。未运行 nginx 时不会启动它。
 - 最近一次有效的证书公网 IP 会保存到 `/etc/nftables.d/panel-cert-ip`，下次申请时直接作为默认值。
+- 更新脚本时，旧路径 `/root/ygkkkca/cert.crt` 与 `private.key` 会自动复制到新路径，并同步 acme.sh 的续期安装路径；旧文件会保留，确认服务正常后可自行删除。
 
 如需关闭 HTTPS，证书和私钥路径都输入 `none`。
 
