@@ -30,8 +30,6 @@ PANEL_USER_DEFAULT="admin"
 PANEL_PASS_DEFAULT="admin123"
 PANEL_CERT_DEFAULT="/etc/panel-ssl/nft-ip-cert.crt"
 PANEL_KEY_DEFAULT="/etc/panel-ssl/nft-ip-private.key"
-PANEL_CERT_LEGACY_DEFAULT="/root/ygkkkca/cert.crt"
-PANEL_KEY_LEGACY_DEFAULT="/root/ygkkkca/private.key"
 PANEL_CERT_IP_FILE="${CONF_DIR}/panel-cert-ip"
 ACME_RENEW_HOOK="/usr/local/bin/nft-forward-acme-hook"
 
@@ -356,29 +354,8 @@ set_acme_domain_conf_value() {
     chmod 600 "$conf_file" 2>/dev/null || true
 }
 
-migrate_legacy_panel_certificate() {
-    local cert_path="$1" key_path="$2" cert_dir key_dir
-
-    [[ "$cert_path" == "$PANEL_CERT_LEGACY_DEFAULT" && "$key_path" == "$PANEL_KEY_LEGACY_DEFAULT" ]] || return 1
-    [[ -f "$cert_path" && -f "$key_path" ]] || return 1
-
-    cert_dir=$(dirname "$PANEL_CERT_DEFAULT")
-    key_dir=$(dirname "$PANEL_KEY_DEFAULT")
-    mkdir -p "$cert_dir" "$key_dir" || return 1
-
-    if [[ -f "$PANEL_CERT_DEFAULT" || -f "$PANEL_KEY_DEFAULT" ]]; then
-        [[ -f "$PANEL_CERT_DEFAULT" && -f "$PANEL_KEY_DEFAULT" ]] || return 1
-    else
-        install -m 644 "$cert_path" "$PANEL_CERT_DEFAULT" || return 1
-        install -m 600 "$key_path" "$PANEL_KEY_DEFAULT" || return 1
-    fi
-
-    chmod 600 "$PANEL_KEY_DEFAULT" 2>/dev/null || true
-    printf '%s|%s\n' "$PANEL_CERT_DEFAULT" "$PANEL_KEY_DEFAULT"
-}
-
 configure_existing_acme_renew_hooks() {
-    local acme_bin="$1" cert_ip="$2" cert_path="${3:-}" key_path="${4:-}"
+    local acme_bin="$1" cert_ip="$2"
     local acme_real acme_home conf_file pre_value post_value seen="|" updated=0
 
     validate_public_ipv4 "$cert_ip" || return 1
@@ -395,11 +372,6 @@ configure_existing_acme_renew_hooks() {
             seen+="${conf_file}|"
             set_acme_domain_conf_value "$conf_file" Le_PreHook "$pre_value" || return 1
             set_acme_domain_conf_value "$conf_file" Le_PostHook "$post_value" || return 1
-            if [[ -n "$cert_path" && -n "$key_path" ]]; then
-                set_acme_domain_conf_value "$conf_file" Le_RealKeyPath "$key_path" || return 1
-                set_acme_domain_conf_value "$conf_file" Le_RealFullChainPath "$cert_path" || return 1
-                set_acme_domain_conf_value "$conf_file" Le_ReloadCmd "systemctl restart ${PANEL_SERVICE}" || return 1
-            fi
             updated=$((updated + 1))
         done
     done
@@ -408,7 +380,7 @@ configure_existing_acme_renew_hooks() {
 }
 
 repair_existing_ip_certificate_renewal() {
-    local cert_ip="$1" cert_path="${2:-}" key_path="${3:-}" acme_bin
+    local cert_ip="$1" acme_bin
 
     acme_bin=$(find_acme_sh 2>/dev/null || true)
     if [[ -z "$acme_bin" ]]; then
@@ -419,7 +391,7 @@ repair_existing_ip_certificate_renewal() {
         warn "无法安装 acme.sh 续期钩子。"
         return 1
     fi
-    if ! configure_existing_acme_renew_hooks "$acme_bin" "$cert_ip" "$cert_path" "$key_path"; then
+    if ! configure_existing_acme_renew_hooks "$acme_bin" "$cert_ip"; then
         warn "未找到 ${cert_ip} 的 acme.sh 域配置，无法补写续期钩子。"
         return 1
     fi
@@ -428,7 +400,7 @@ repair_existing_ip_certificate_renewal() {
 }
 
 repair_panel_ip_certificate_renewal() {
-    local cert_path="$1" key_path="${2:-}" cert_ip
+    local cert_path="$1" cert_ip
 
     cert_ip=$(get_cert_ip_from_file "$cert_path" 2>/dev/null || get_saved_cert_ip 2>/dev/null || true)
     if ! validate_public_ipv4 "$cert_ip"; then
@@ -437,7 +409,7 @@ repair_panel_ip_certificate_renewal() {
     fi
 
     save_cert_ip "$cert_ip" || warn "公网 IP 保存失败，下次配置时可能仍需重新输入。"
-    repair_existing_ip_certificate_renewal "$cert_ip" "$cert_path" "$key_path"
+    repair_existing_ip_certificate_renewal "$cert_ip"
 }
 
 NGINX_WAS_RUNNING=0
@@ -2668,7 +2640,7 @@ do_dns_forward_menu() {
 
 # ============== Web 面板管理 ==============
 install_panel() {
-    local panel_port panel_user panel_pass panel_host panel_cert panel_key existing_panel cert_pair
+    local panel_port panel_user panel_pass panel_host panel_cert panel_key existing_panel
     existing_panel=0
     [[ -f "${PANEL_SERVICE_FILE}" ]] && existing_panel=1
 
@@ -2686,19 +2658,10 @@ install_panel() {
         panel_host="${panel_host:-0.0.0.0}"
         panel_cert="${panel_cert:-}"
         panel_key="${panel_key:-}"
-        if cert_pair=$(migrate_legacy_panel_certificate "$panel_cert" "$panel_key" 2>/dev/null); then
-            IFS='|' read -r panel_cert panel_key <<< "$cert_pair"
-            info "已将 nft IP 证书迁移到 ${PANEL_CERT_DEFAULT}。"
-        elif [[ "$panel_cert" == "$PANEL_CERT_LEGACY_DEFAULT" || "$panel_key" == "$PANEL_KEY_LEGACY_DEFAULT" ]]; then
-            warn "未能迁移旧 IP 证书，当前仍使用旧路径。"
-        fi
         if [[ -z "$panel_cert" && -z "$panel_key" && -f "$PANEL_CERT_DEFAULT" && -f "$PANEL_KEY_DEFAULT" ]]; then
             panel_cert="$PANEL_CERT_DEFAULT"
             panel_key="$PANEL_KEY_DEFAULT"
             info "检测到默认路径证书，已自动恢复 HTTPS 配置。"
-        elif [[ -z "$panel_cert" && -z "$panel_key" ]] && cert_pair=$(migrate_legacy_panel_certificate "$PANEL_CERT_LEGACY_DEFAULT" "$PANEL_KEY_LEGACY_DEFAULT" 2>/dev/null); then
-            IFS='|' read -r panel_cert panel_key <<< "$cert_pair"
-            info "已将 nft IP 证书迁移到 ${PANEL_CERT_DEFAULT}。"
         fi
         info "检测到已安装 Web 面板，本次仅更新面板程序并保留现有配置。"
         echo "端口: ${panel_port}"
@@ -3716,7 +3679,7 @@ EOF
     }
 
     if (( existing_panel )) && [[ -f "$panel_cert" && -f "$panel_key" ]]; then
-        repair_panel_ip_certificate_renewal "$panel_cert" "$panel_key" \
+        repair_panel_ip_certificate_renewal "$panel_cert" \
             || warn "现有证书仍可使用，但自动续期配置未完全修复。"
     fi
 
@@ -3872,7 +3835,7 @@ update_panel_tls() {
                 return 1
             }
         else
-            repair_panel_ip_certificate_renewal "$cert_path" "$key_path" \
+            repair_panel_ip_certificate_renewal "$cert_path" \
                 || warn "现有证书仍可使用，但自动续期配置未完全修复。"
         fi
     fi

@@ -61,7 +61,6 @@ Web 面板入口在主菜单：
 - 系统可以安装并运行 `acme.sh`
 - 首次申请和定时续期时如果检测到 nginx 正在运行，脚本会临时停止 nginx 释放 80 端口；无论成功或失败，都会自动恢复 nginx。未运行 nginx 时不会启动它。
 - 最近一次有效的证书公网 IP 会保存到 `/etc/nftables.d/panel-cert-ip`，下次申请时直接作为默认值。
-- 更新脚本时，旧路径 `/root/ygkkkca/cert.crt` 与 `private.key` 会自动复制到新路径，并同步 acme.sh 的续期安装路径；旧文件会保留，确认服务正常后可自行删除。
 
 如需关闭 HTTPS，证书和私钥路径都输入 `none`。
 
